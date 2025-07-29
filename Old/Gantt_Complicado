@@ -1,0 +1,765 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import seaborn as sns
+import warnings
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from tkcalendar import DateEntry
+from datetime import datetime
+import os
+from pathlib import Path
+import logging
+
+# Configuração de logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    filename='alocacao_equipe.log'
+)
+logger = logging.getLogger(__name__)
+
+class AlocacaoEquipeApp:
+    """Aplicação para gerenciamento de alocação de equipes e visualização de períodos."""
+    
+    # Constantes e configurações
+    DEFAULT_FILES = {
+        'estaleiro': 'Planejamento Estaleiro.xlsx',
+        'ferias': 'Férias.xlsx',
+        'geral': 'Planejamento Geral.xlsx'
+    }
+    
+    OUTPUT_FILE = 'alocacao_equipe_ferias.pdf'
+    
+    # Mapeamento de cores por tipo de atividade
+    ACTIVITY_COLORS = {
+        'Estaleiro': 'blue',
+        'Férias': 'red',
+        'Workshop': 'green',
+        'Treinamento': 'orange',
+        'Embarque': 'purple',
+        'Visita Técnica': 'teal',
+        'Folga Alinhada': 'magenta'
+    }
+    
+    def __init__(self):
+        """Inicializa a aplicação e suas configurações."""
+        self.hoje = pd.Timestamp.today().normalize()
+        self.files = self.DEFAULT_FILES.copy()
+        self.data_inicio_analise = None
+        self.data_fim_analise = None
+        self.combined_df = None
+        
+        # Configurações de estilo do matplotlib
+        self._setup_plot_style()
+        
+        # Supressão de avisos
+        warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+    
+    def _setup_plot_style(self):
+        """Configura o estilo padrão para os gráficos."""
+        sns.set_style("whitegrid")
+        plt.rcParams['figure.figsize'] = (16, 8)
+        plt.rcParams['font.size'] = 10
+        plt.rcParams['text.usetex'] = False
+        plt.rcParams['mathtext.fontset'] = 'dejavusans'
+    
+    def select_files(self):
+        """Interface para selecionar arquivos de entrada."""
+        root = tk.Tk()
+        root.title("Seleção de Arquivos")
+        root.geometry("600x300")
+        
+        frame = ttk.Frame(root, padding="10")
+        frame.pack(fill=tk.BOTH, expand=True)
+        
+        file_vars = {}
+        file_entries = {}
+        
+        for i, (key, default) in enumerate(self.DEFAULT_FILES.items()):
+            # Label para o arquivo
+            ttk.Label(frame, text=f"Arquivo {key.capitalize()}:").grid(row=i, column=0, sticky=tk.W, padx=5, pady=5)
+            
+            # Entry para o caminho do arquivo
+            file_var = tk.StringVar(value=default)
+            file_vars[key] = file_var
+            entry = ttk.Entry(frame, textvariable=file_var, width=50)
+            entry.grid(row=i, column=1, padx=5, pady=5)
+            file_entries[key] = entry
+            
+            # Botão para procurar arquivo
+            ttk.Button(
+                frame, 
+                text="Procurar", 
+                command=lambda k=key, v=file_var: self._browse_file(v)
+            ).grid(row=i, column=2, padx=5, pady=5)
+        
+        # Botão para confirmar seleção
+        ttk.Button(
+            frame, 
+            text="Confirmar", 
+            command=lambda: self._save_file_selection(root, file_vars)
+        ).grid(row=len(self.DEFAULT_FILES)+1, column=0, columnspan=3, pady=20)
+        
+        root.mainloop()
+        return all(os.path.exists(path) for path in self.files.values())
+    
+    def _browse_file(self, var):
+        """Abre diálogo para selecionar arquivo."""
+        filename = filedialog.askopenfilename(
+            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")]
+        )
+        if filename:
+            var.set(filename)
+    
+    def _save_file_selection(self, root, file_vars):
+        """Salva a seleção de arquivos feita pelo usuário."""
+        for key, var in file_vars.items():
+            self.files[key] = var.get()
+        root.quit()
+    
+    def select_analysis_dates(self):
+        """Interface para selecionar datas de início e fim da análise."""
+        root = tk.Tk()
+        root.title("Seleção de Datas de Análise")
+        root.geometry("400x200")
+        
+        frame = ttk.Frame(root, padding="10")
+        frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Data de início
+        ttk.Label(frame, text="Data Início Análise:").grid(row=0, column=0, padx=10, pady=10, sticky=tk.W)
+        inicio_entry = DateEntry(frame, date_pattern="dd/mm/yyyy")
+        inicio_entry.grid(row=0, column=1, padx=10, pady=10)
+        
+        # Data de fim
+        ttk.Label(frame, text="Data Fim Análise:").grid(row=1, column=0, padx=10, pady=10, sticky=tk.W)
+        fim_entry = DateEntry(frame, date_pattern="dd/mm/yyyy")
+        fim_entry.grid(row=1, column=1, padx=10, pady=10)
+        
+        # Botão para salvar
+        save_button = ttk.Button(
+            frame, 
+            text="Salvar Datas", 
+            command=lambda: self._save_dates(root, inicio_entry, fim_entry)
+        )
+        save_button.grid(row=2, column=0, columnspan=2, pady=20)
+        
+        root.mainloop()
+        return self.data_inicio_analise is not None and self.data_fim_analise is not None
+    
+    def _save_dates(self, root, inicio_entry, fim_entry):
+        """Salva as datas selecionadas pelo usuário."""
+        self.data_inicio_analise = pd.Timestamp(inicio_entry.get_date())
+        self.data_fim_analise = pd.Timestamp(fim_entry.get_date())
+        
+        if self.data_inicio_analise > self.data_fim_analise:
+            messagebox.showerror(
+                "Erro", 
+                "A data de início não pode ser posterior à data de fim."
+            )
+            return
+        
+        root.quit()
+    
+    def read_estaleiro_data(self):
+        """Lê dados do arquivo de estaleiro."""
+        try:
+            file_path = self.files['estaleiro']
+            logger.info(f"Lendo dados do arquivo de estaleiro: {file_path}")
+            
+            # Leitura da aba "Equipe"
+            equipe_df = pd.read_excel(file_path, sheet_name='Equipe')
+            equipe_df = equipe_df.iloc[:, [0, 1, 3, 4, 5, 7]].dropna(subset=[equipe_df.columns[4]])
+            equipe_df.columns = ['Disciplina', 'Matrícula', 'Função', 'Projeto', 'Experiência', 'Nome']
+            
+            # Leitura da aba "Planejamento IED"
+            planejamento_df = pd.read_excel(file_path, sheet_name='Planejamento IED', skiprows=8, usecols="C:E")
+            planejamento_df = planejamento_df.dropna(subset=[planejamento_df.columns[0]])
+            planejamento_df.columns = ['Nome', 'Início', 'Término']
+            
+            # Converter datas para formato datetime
+            planejamento_df['Início'] = pd.to_datetime(planejamento_df['Início'], errors='coerce')
+            planejamento_df['Término'] = pd.to_datetime(planejamento_df['Término'], errors='coerce')
+            
+            # Remover linhas com datas inválidas
+            planejamento_df = planejamento_df.dropna(subset=['Início', 'Término'])
+            
+            # Merge com "Equipe" para trazer a matrícula
+            planejamento_df = pd.merge(
+                planejamento_df, 
+                equipe_df[['Nome', 'Matrícula', 'Disciplina', 'Função', 'Projeto']],
+                on='Nome', 
+                how='left'
+            )
+            planejamento_df['Tipo'] = 'Estaleiro'
+            
+            return equipe_df, planejamento_df
+        except Exception as e:
+            logger.error(f"Erro ao ler dados do estaleiro: {str(e)}")
+            messagebox.showerror("Erro", f"Falha ao ler arquivo de estaleiro: {str(e)}")
+            return None, None
+    
+    def read_ferias_data(self):
+        """Lê dados do arquivo de férias."""
+        try:
+            file_path = self.files['ferias']
+            logger.info(f"Lendo dados do arquivo de férias: {file_path}")
+            
+            df_ferias = pd.read_excel(file_path, skiprows=1, header=None)
+            
+            # Definir colunas manualmente
+            df_ferias.columns = [
+                "Matrícula", "Nome do Empregado", "Período Aquisitivo", "Prazo Mínimo",
+                "Prazo Máximo", "13º Salário", "Abono", "Período Único",
+                "Primeira Parcela", "Termino Primeira Parcela", "Nº de Dias 1",
+                "Segunda Parcela", "Termino Segunda Parcela", "Nº de Dias 2",
+                "Terceira Parcela", "Termino Terceira Parcela", "Nº de Dias 3",
+                "Situação"
+            ]
+            
+            # Selecionar colunas relevantes
+            colunas_indices = [0, 1, 8, 9, 11, 12, 14, 15]
+            df_selecionado = df_ferias.iloc[:, colunas_indices]
+            df_selecionado.columns = [
+                "Matrícula", "Nome do Empregado",
+                "Primeira Parcela", "Termino Primeira Parcela",
+                "Segunda Parcela", "Termino Segunda Parcela",
+                "Terceira Parcela", "Termino Terceira Parcela"
+            ]
+            
+            # Criar DataFrames para cada parcela
+            parcelas = []
+            
+            for inicio, fim, parcela in [
+                ("Primeira Parcela", "Termino Primeira Parcela", "1ª"),
+                ("Segunda Parcela", "Termino Segunda Parcela", "2ª"),
+                ("Terceira Parcela", "Termino Terceira Parcela", "3ª")
+            ]:
+                df_parcela = df_selecionado[["Matrícula", "Nome do Empregado", inicio, fim]].dropna(subset=[inicio])
+                df_parcela = df_parcela.rename(columns={inicio: "Início", fim: "Término"})
+                df_parcela["Tipo"] = f"Férias ({parcela})"
+                parcelas.append(df_parcela)
+            
+            # Concatenar as parcelas de férias
+            df_ferias_final = pd.concat(parcelas, ignore_index=True)
+            df_ferias_final['Início'] = pd.to_datetime(df_ferias_final['Início'], errors='coerce')
+            df_ferias_final['Término'] = pd.to_datetime(df_ferias_final['Término'], errors='coerce')
+            
+            # Remover linhas com datas inválidas
+            df_ferias_final = df_ferias_final.dropna(subset=['Início', 'Término'])
+            
+            return df_ferias_final
+        except Exception as e:
+            logger.error(f"Erro ao ler dados de férias: {str(e)}")
+            messagebox.showerror("Erro", f"Falha ao ler arquivo de férias: {str(e)}")
+            return None
+    
+    def read_planejamento_geral(self):
+        """Lê dados do arquivo de planejamento geral."""
+        try:
+            file_path = self.files['geral']
+            logger.info(f"Lendo dados do arquivo de planejamento geral: {file_path}")
+            
+            planejamento_geral_df = pd.read_excel(
+                file_path, 
+                usecols=["Nome", "Matrícula", "Início", "Término", "DIAS", "Atividade"]
+            )
+            planejamento_geral_df = planejamento_geral_df.rename(columns={'Atividade': 'Tipo'})
+            
+            # Converter datas para formato datetime
+            planejamento_geral_df['Início'] = pd.to_datetime(planejamento_geral_df['Início'], errors='coerce')
+            planejamento_geral_df['Término'] = pd.to_datetime(planejamento_geral_df['Término'], errors='coerce')
+            
+            # Remover linhas com datas inválidas
+            planejamento_geral_df = planejamento_geral_df.dropna(subset=['Início', 'Término'])
+            
+            return planejamento_geral_df
+        except Exception as e:
+            logger.error(f"Erro ao ler dados de planejamento geral: {str(e)}")
+            messagebox.showerror("Erro", f"Falha ao ler arquivo de planejamento geral: {str(e)}")
+            return None
+    
+    def tem_conflito(self, row):
+        """Verifica se há conflito de alocação para uma matrícula no período de análise."""
+        if self.combined_df is None or self.data_inicio_analise is None or self.data_fim_analise is None:
+            return False
+            
+        periodos = self.combined_df[self.combined_df['Matrícula'] == row['Matrícula']]
+        
+        # Verificação de sobreposição de períodos no intervalo analisado
+        for _, periodo in periodos.iterrows():
+            if (periodo['Início'] <= self.data_fim_analise and periodo['Término'] >= self.data_inicio_analise):
+                return True
+                
+        return False
+    
+    def atribuir_cor(self, tipo):
+            """Atribui cor com base no tipo de atividade."""
+            return self.ACTIVITY_COLORS.get(tipo, 'gray')
+        
+    def process_data(self):
+        """Processa todos os dados e combina em um único DataFrame."""
+        # Ler dados dos arquivos
+        equipe_df, planejamento_df = self.read_estaleiro_data()
+        df_ferias_final = self.read_ferias_data()
+        planejamento_geral_df = self.read_planejamento_geral()
+        
+        # Verificar se todos os dados foram lidos corretamente
+        if any(df is None for df in [equipe_df, planejamento_df, df_ferias_final, planejamento_geral_df]):
+            logger.error("Não foi possível processar todos os dados necessários.")
+            return False
+            
+        # Combinar todos os dados em um único DataFrame
+        try:
+            # Selecionar colunas relevantes de cada DataFrame
+            planejamento_cols = ['Matrícula', 'Nome', 'Início', 'Término', 'Disciplina', 'Função', 'Projeto', 'Tipo']
+            ferias_cols = ['Matrícula', 'Nome do Empregado', 'Início', 'Término', 'Tipo']
+            geral_cols = ['Matrícula', 'Nome', 'Início', 'Término', 'Tipo']
+            
+            # Renomear coluna de nome no DataFrame de férias
+            ferias_renamed = df_ferias_final[ferias_cols].rename(columns={'Nome do Empregado': 'Nome'})
+            
+            # Combinar os DataFrames
+            self.combined_df = pd.concat([
+                planejamento_df[planejamento_cols],
+                ferias_renamed,
+                planejamento_geral_df[geral_cols]
+            ], ignore_index=True)
+            
+            # Filtrar apenas matrículas presentes em "Equipe"
+            self.combined_df = self.combined_df[self.combined_df['Matrícula'].isin(equipe_df['Matrícula'])]
+            
+            # Adicionar cor com base no tipo de atividade
+            self.combined_df['Cor'] = self.combined_df['Tipo'].apply(self.atribuir_cor)
+            
+            # Ordenar por Disciplina, Função, Projeto e Matrícula
+            self.combined_df = self.combined_df.sort_values(
+                by=['Disciplina', 'Função', 'Projeto', 'Matrícula'], 
+                na_position='last'
+            )
+            
+            # Armazenar DataFrame de equipe para uso posterior
+            self.equipe_df = equipe_df
+            
+            # Criar lista única de membros por matrícula
+            self.unique_members = self.combined_df.drop_duplicates(
+                subset=['Matrícula'], 
+                keep='first'
+            ).reset_index(drop=True)
+            
+            return True
+        except Exception as e:
+            logger.error(f"Erro ao processar dados: {str(e)}")
+            messagebox.showerror("Erro", f"Falha ao processar dados: {str(e)}")
+            return False
+
+    def create_plot(self):
+        """Cria o gráfico de visualização de alocação."""
+        if self.combined_df is None or self.unique_members is None:
+            logger.error("Dados não processados. Execute process_data() primeiro.")
+            return None, None
+            
+        fig, ax = plt.subplots(figsize=(16, 8))
+        
+        # Plotar os períodos de cada funcionário
+        for i, row in self.unique_members.iterrows():
+            matricula = row['Matrícula']
+            periodos = self.combined_df[self.combined_df['Matrícula'] == matricula]
+            
+            for _, periodo in periodos.iterrows():
+                duracao = (periodo['Término'] - periodo['Início']).days
+                ax.barh(
+                    y=i, 
+                    width=duracao + 1,  # +1 para incluir o dia final
+                    left=periodo['Início'], 
+                    height=0.4, 
+                    color=periodo['Cor'],
+                    alpha=0.8
+                )
+                
+                # Adicionar texto para períodos longos
+                if duracao > 10:
+                    ax.text(
+                        periodo['Início'] + pd.Timedelta(days=duracao/2), 
+                        i, 
+                        periodo['Tipo'],
+                        ha='center',
+                        va='center',
+                        fontsize=8,
+                        color='black'
+                    )
+            
+            # Adicionar linha horizontal para separar cada nome
+            ax.axhline(y=i, color='gray', linestyle=':', linewidth=0.5)
+        
+        # Adicionar linhas horizontais para separar disciplinas
+        disciplinas = self.unique_members['Disciplina'].unique()
+        posicoes_divisao = []
+        ultima_posicao = -1
+        
+        for disciplina in disciplinas:
+            if pd.notna(disciplina):  # Ignorar NaN
+                ultima_posicao = self.unique_members[
+                    self.unique_members['Disciplina'] == disciplina
+                ].index[-1] + 0.5
+                
+                posicoes_divisao.append(ultima_posicao)
+                ax.axhline(y=ultima_posicao, color='gray', linestyle='--', linewidth=1)
+                
+                # Adicionar rótulo da disciplina
+                ax.text(
+                    pd.Timestamp('2025-01-01'), 
+                    ultima_posicao - 0.25, 
+                    f"--- {disciplina} ---",
+                    ha='left',
+                    va='bottom',
+                    fontsize=10,
+                    fontweight='bold',
+                    color='gray'
+                )
+        
+        # Configurar o eixo y com matrícula e nome
+        y_labels = []
+        y_colors = []
+        
+        for i, row in self.unique_members.iterrows():
+            nome_completo = f"{row['Nome']} ({row['Projeto'] if pd.notna(row['Projeto']) else 'N/A'})"
+            y_labels.append(nome_completo)
+            
+            # Destacar em verde se não tem conflito, vermelho se tem
+            tem_conflito = self.tem_conflito(row)
+            y_colors.append('red' if tem_conflito else 'green')
+        
+        ax.set_yticks(range(len(self.unique_members)))
+        ax.set_yticklabels(y_labels)
+        
+        for label, color in zip(ax.get_yticklabels(), y_colors):
+            label.set_color(color)
+        
+        ax.set_ylabel('Equipe (Nome)', fontweight='bold')
+        ax.set_xlabel('Tempo', fontweight='bold')
+        
+        # Marcar linha vertical para o dia atual
+        ax.axvline(x=self.hoje, color='red', linestyle='--', linewidth=2, label='Hoje')
+        ax.text(
+            self.hoje, 
+            len(self.unique_members), 
+            'Hoje', 
+            color='red', 
+            fontsize=12, 
+            verticalalignment='bottom'
+        )
+        
+        # Destacar período de análise
+        ax.axvspan(
+            self.data_inicio_analise, 
+            self.data_fim_analise, 
+            color='gray', 
+            alpha=0.3, 
+            label='Período de Análise'
+        )
+        ax.text(
+            self.data_inicio_analise, 
+            len(self.unique_members), 
+            'Análise', 
+            color='black', 
+            fontsize=12, 
+            verticalalignment='bottom'
+        )
+        
+        # Formatar o eixo x
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%b/%Y'))
+        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=1))
+        plt.xticks(rotation=45)
+        
+        # Ajustar os limites do eixo x para mostrar o ano completo
+        ano_atual = self.hoje.year
+        ax.set_xlim(pd.Timestamp(f'{ano_atual}-01-01'), pd.Timestamp(f'{ano_atual}-12-31'))
+        
+        # Criar legenda dinâmica com base nas cores utilizadas
+        tipos_usados = self.combined_df['Tipo'].unique()
+        for tipo in tipos_usados:
+            cor = self.atribuir_cor(tipo)
+            ax.plot([], [], color=cor, label=tipo, linewidth=5)
+        
+        ax.legend(
+            title='Legenda', 
+            bbox_to_anchor=(1.05, 1), 
+            loc='upper left', 
+            frameon=True,
+            framealpha=0.8
+        )
+        
+        # Ajustar layout
+        ax.set_title(
+            'Alocação da Equipe e Férias por Período (Ordenado por Disciplina, Função e Projeto)',
+            fontweight='bold',
+            fontsize=14
+        )
+        
+        # Adicionar linhas verticais para cada mês
+        for tick in ax.get_xticks():
+            ax.axvline(x=tick, color='gray', linestyle='--', linewidth=0.5)
+        
+        return fig, ax
+
+    def show_conflict_report(self):
+        """Exibe relatório de conflitos de alocação."""
+        if self.combined_df is None or self.unique_members is None:
+            logger.error("Dados não processados.")
+            return
+            
+        conflitos = []
+        
+        for _, row in self.unique_members.iterrows():
+            if self.tem_conflito(row):
+                periodos = self.combined_df[
+                    (self.combined_df['Matrícula'] == row['Matrícula']) & 
+                    (self.combined_df['Início'] <= self.data_fim_analise) & 
+                    (self.combined_df['Término'] >= self.data_inicio_analise)
+                ]
+                
+                conflitos.append({
+                    'Nome': row['Nome'],
+                    'Matrícula': row['Matrícula'],
+                    'Disciplina': row.get('Disciplina', 'N/A'),
+                    'Projeto': row.get('Projeto', 'N/A'),
+                    'Períodos': periodos[['Tipo', 'Início', 'Término']].to_dict('records')
+                })
+        
+        if conflitos:
+            root = tk.Tk()
+            root.title("Relatório de Conflitos")
+            root.geometry("800x600")
+            
+            frame = ttk.Frame(root, padding="10")
+            frame.pack(fill=tk.BOTH, expand=True)
+            
+            ttk.Label(
+                frame, 
+                text="Conflitos Encontrados no Período de Análise", 
+                font=("Arial", 14, "bold")
+            ).pack(pady=10)
+            
+            text_widget = tk.Text(frame, wrap=tk.WORD, width=80, height=30)
+            text_widget.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            
+            scroll = ttk.Scrollbar(text_widget, command=text_widget.yview)
+            text_widget.configure(yscrollcommand=scroll.set)
+            scroll.pack(side=tk.RIGHT, fill=tk.Y)
+            
+            for conflito in conflitos:
+                text_widget.insert(tk.END, f"Nome: {conflito['Nome']}\n")
+                text_widget.insert(tk.END, f"Matrícula: {conflito['Matrícula']}\n")
+                text_widget.insert(tk.END, f"Disciplina: {conflito['Disciplina']}\n")
+                text_widget.insert(tk.END, f"Projeto: {conflito['Projeto']}\n")
+                text_widget.insert(tk.END, "Períodos:\n")
+                
+                for periodo in conflito['Períodos']:
+                    inicio = periodo['Início'].strftime('%d/%m/%Y')
+                    termino = periodo['Término'].strftime('%d/%m/%Y')
+                    text_widget.insert(tk.END, f"  - {periodo['Tipo']}: {inicio} até {termino}\n")
+                
+                text_widget.insert(tk.END, "\n" + "-"*50 + "\n\n")
+            
+            text_widget.config(state=tk.DISABLED)  # Tornar somente leitura
+            
+            ttk.Button(
+                frame, 
+                text="Fechar", 
+                command=root.destroy
+            ).pack(pady=10)
+            
+            root.mainloop()
+        else:
+            messagebox.showinfo("Relatório", "Não foram encontrados conflitos no período de análise.")
+
+    def save_plot(self, fig, output_format='pdf'):
+        """Salva o gráfico em um arquivo."""
+        try:
+            # Configurar nome do arquivo baseado no formato
+            if output_format == 'pdf':
+                output_file = 'alocacao_equipe.pdf'
+            else:
+                output_file = f'alocacao_equipe.{output_format}'
+                
+            # Criar diretório de saída se não existir
+            output_dir = 'relatorios'
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Caminho completo para o arquivo de saída
+            output_path = os.path.join(output_dir, output_file)
+            
+            # Ajustar layout e salvar
+            plt.tight_layout()
+            fig.savefig(output_path, format=output_format, dpi=300, bbox_inches='tight')
+            
+            logger.info(f"Gráfico salvo em {output_path}")
+            messagebox.showinfo("Sucesso", f"Gráfico salvo em {output_path}")
+            
+            return output_path
+        except Exception as e:
+            logger.error(f"Erro ao salvar gráfico: {str(e)}")
+            messagebox.showerror("Erro", f"Falha ao salvar gráfico: {str(e)}")
+            return None
+
+    def export_data(self):
+        """Exporta os dados processados para Excel."""
+        if self.combined_df is None:
+            logger.error("Sem dados para exportar.")
+            messagebox.showerror("Erro", "Não há dados para exportar.")
+            return
+            
+        try:
+            # Criar diretório de saída se não existir
+            output_dir = 'relatorios'
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Caminho completo para o arquivo de saída
+            output_path = os.path.join(output_dir, 'dados_alocacao.xlsx')
+            
+            # Criar um escritor Excel
+            with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+                # Exportar dados combinados
+                self.combined_df.to_excel(writer, sheet_name='Alocações', index=False)
+                
+                # Exportar membros únicos
+                self.unique_members.to_excel(writer, sheet_name='Equipe', index=False)
+                
+                # Exportar apenas conflitos
+                conflitos_df = self.unique_members[self.unique_members.apply(self.tem_conflito, axis=1)]
+                if not conflitos_df.empty:
+                    conflitos_df.to_excel(writer, sheet_name='Conflitos', index=False)
+            
+            logger.info(f"Dados exportados para {output_path}")
+            messagebox.showinfo("Sucesso", f"Dados exportados para {output_path}")
+            
+            return output_path
+        except Exception as e:
+            logger.error(f"Erro ao exportar dados: {str(e)}")
+            messagebox.showerror("Erro", f"Falha ao exportar dados: {str(e)}")
+            return None
+        
+    def run(self):
+        """Executa o fluxo principal da aplicação."""
+        try:
+            # Seleção de arquivos
+            if not self.select_files():
+                messagebox.showerror("Erro", "Falha na seleção de arquivos!")
+                return False
+            
+            # Seleção de datas
+            if not self.select_analysis_dates():
+                messagebox.showerror("Erro", "Falha na seleção de datas!")
+                return False
+            
+            # Processar dados
+            if not self.process_data():
+                messagebox.showerror("Erro", "Falha no processamento dos dados!")
+                return False
+            
+            # Criar gráfico
+            fig, ax = self.create_plot()
+            if fig is None:
+                messagebox.showerror("Erro", "Falha na criação do gráfico!")
+                return False
+            
+            # Salvar gráfico
+            self.save_plot(fig)
+            
+            # Mostrar gráfico
+            plt.show()
+            
+            # Mostrar relatório de conflitos
+            self.show_conflict_report()
+            
+            # Exportar dados
+            self.export_data()
+            
+            return True
+        except Exception as e:
+            logger.error(f"Erro geral na execução: {str(e)}")
+            messagebox.showerror("Erro", f"Falha na execução: {str(e)}")
+            return False
+
+
+def show_summary(app):
+    """Mostra um resumo das alocações por disciplina."""
+    if app.combined_df is None:
+        messagebox.showerror("Erro", "Não há dados para exibir.")
+        return
+    
+    # Agrupar por disciplina
+    disciplina_df = app.unique_members.groupby('Disciplina').size().reset_index(name='Quantidade')
+    
+    # Calcular total de funcionários por disciplina no período de análise
+    funcionarios_periodo = []
+    for disciplina in disciplina_df['Disciplina']:
+        if pd.isna(disciplina):
+            continue
+            
+        membros = app.unique_members[app.unique_members['Disciplina'] == disciplina]
+        count = sum(1 for _, row in membros.iterrows() if app.tem_conflito(row))
+        funcionarios_periodo.append((disciplina, count))
+    
+    # Criar janela de resumo
+    root = tk.Tk()
+    root.title("Resumo por Disciplina")
+    root.geometry("500x400")
+    
+    frame = ttk.Frame(root, padding="10")
+    frame.pack(fill=tk.BOTH, expand=True)
+    
+    ttk.Label(
+        frame, 
+        text="Resumo de Alocações por Disciplina", 
+        font=("Arial", 14, "bold")
+    ).pack(pady=10)
+    
+    # Criar tabela
+    tree = ttk.Treeview(frame, columns=("disciplina", "total", "alocados"), show="headings")
+    tree.heading("disciplina", text="Disciplina")
+    tree.heading("total", text="Total de Funcionários")
+    tree.heading("alocados", text="Alocados no Período")
+    
+    tree.column("disciplina", width=200)
+    tree.column("total", width=100, anchor="center")
+    tree.column("alocados", width=100, anchor="center")
+    
+    for disciplina, total in zip(disciplina_df['Disciplina'], disciplina_df['Quantidade']):
+        if pd.isna(disciplina):
+            continue
+            
+        alocados = next((count for disc, count in funcionarios_periodo if disc == disciplina), 0)
+        tree.insert("", "end", values=(disciplina, total, alocados))
+    
+    tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+    
+    ttk.Button(
+        frame, 
+        text="Fechar", 
+        command=root.destroy
+    ).pack(pady=10)
+    
+    root.mainloop()
+
+
+def main():
+    """Função principal do programa."""
+    try:
+        app = AlocacaoEquipeApp()
+        if app.run():
+            # Após a execução bem-sucedida, perguntar se quer ver o resumo
+            if messagebox.askyesno("Resumo", "Deseja ver um resumo das alocações por disciplina?"):
+                show_summary(app)
+                
+            logger.info("Programa concluído com sucesso!")
+            messagebox.showinfo("Sucesso", "Programa concluído com sucesso!")
+    except Exception as e:
+        logger.error(f"Erro fatal: {str(e)}")
+        messagebox.showerror("Erro Fatal", f"Ocorreu um erro inesperado: {str(e)}")
+
+
+if __name__ == "__main__":
+    main()
