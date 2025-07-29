@@ -47,7 +47,7 @@ def read_estaleiro_data():
 
         # Merge com "Equipe" para trazer a matrícula
         planejamento_df = pd.merge(planejamento_df, equipe_df[['Nome', 'Matrícula', 'Disciplina', 'Função', 'Projeto']],
-                                     on='Nome', how='left')
+                                    on='Nome', how='left')
         planejamento_df['Tipo'] = 'Estaleiro'
 
         return equipe_df, planejamento_df
@@ -268,9 +268,10 @@ def create_plot(combined_df, equipe_df, data_inicio_analise, data_fim_analise):
     ax.set_xlabel('Data')
 
     ax.axvline(x=hoje, color='red', linestyle='--', linewidth=2, label=' Hoje')
-    ax.text(hoje, len(unique_members), ' Hoje', color='red', fontsize=12, verticalalignment='bottom')
+    ax.text(hoje, len(unique_members)-0.2, ' Hoje', color='red', fontsize=12, verticalalignment='bottom')
     ax.axvspan(data_inicio_analise, data_fim_analise, color='gray', alpha=0.3, label='Período de Análise')
-    ax.text(data_inicio_analise, len(unique_members), 'Análise', color='black', fontsize=12, verticalalignment='top')
+    ax.text(data_inicio_analise, ax.get_ylim()[1] + 0.8, 'Análise', color='black', fontsize=12, verticalalignment='top')
+
 
     # Formatar o eixo x
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
@@ -289,11 +290,7 @@ def create_plot(combined_df, equipe_df, data_inicio_analise, data_fim_analise):
     for tick in ax.get_xticks():
         ax.axvline(x=tick, color='gray', linestyle='--', linewidth=0.5)
     
-    # Detectar e adicionar conflitos como texto no final do gráfico
-    conflitos_texto = detectar_conflitos(combined_df)
-    fig.text(0.5, 0.01, conflitos_texto, ha='center', va='bottom', fontsize=9, 
-             bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.5))
-
+    # Removed the fig.text() call for conflicts_text from here.
     return fig
 
 # --- Streamlit Application ---
@@ -348,8 +345,19 @@ def main_streamlit():
                     combined_df.at[idx, 'Função'] = emp_data['Função']
                     combined_df.at[idx, 'Projeto'] = emp_data['Projeto']
         
+        # Create and display the plot
         fig = create_plot(combined_df, equipe_df, data_inicio_analise, data_fim_analise)
         st.pyplot(fig) # Display the plot in Streamlit
+
+        # --- Conflitos Detectados Section ---
+        st.write("---") # Separator for visual clarity
+        st.header("Conflitos Detectados")
+        conflitos_texto = detectar_conflitos(combined_df)
+        if "Nenhum conflito detectado." in conflitos_texto:
+            st.info(conflitos_texto)
+        else:
+            # Use st.markdown with a code block to preserve newlines
+            st.warning(f"```\n{conflitos_texto}\n```")
 
     else:
         st.warning("Não foi possível carregar os dados. Verifique se os arquivos Excel estão presentes e corretos.")
