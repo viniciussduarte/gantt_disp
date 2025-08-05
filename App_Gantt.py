@@ -162,20 +162,12 @@ class DataLoader:
             DataFrame com dados de planejamento geral.
         """
         try:
-            # --- MODIFICAÇÃO: Incluindo a coluna 'Detalhamento'
             planejamento_geral_df = pd.read_excel(
                 Config.FILE_PATH_GERAL, 
-                usecols=["Nome", "Matrícula", "Início", "Término", "DIAS", "Atividade", "Detalhamento"]
+                usecols=["Nome", "Matrícula", "Início", "Término", "DIAS", "Atividade", "Detalhamento"] # ALTERADO
             )
             
             planejamento_geral_df = planejamento_geral_df.rename(columns={'Atividade': 'Tipo'})
-            
-            # Tratamento para garantir que a coluna existe e preencher valores ausentes
-            if 'Detalhamento' not in planejamento_geral_df.columns:
-                planejamento_geral_df['Detalhamento'] = "Sem detalhamento"
-            else:
-                planejamento_geral_df['Detalhamento'] = planejamento_geral_df['Detalhamento'].fillna("Sem detalhamento")
-
             planejamento_geral_df[['Início', 'Término']] = planejamento_geral_df[['Início', 'Término']].apply(pd.to_datetime)
             
             return planejamento_geral_df
@@ -193,7 +185,7 @@ class DataProcessor:
     
     @staticmethod
     def check_conflict(row: pd.Series, combined_df: pd.DataFrame, 
-                         start_date: pd.Timestamp, end_date: pd.Timestamp) -> bool:
+                       start_date: pd.Timestamp, end_date: pd.Timestamp) -> bool:
         """
         Verifica se há conflitos de agenda para uma pessoa em um período específico.
         
@@ -302,14 +294,13 @@ class DataProcessor:
                 planejamento_geral_df['Matrícula'].isin(equipe_df['Matrícula'])
             ].copy()
             if not planejamento_geral_df_filtrado.empty:
-                # --- MODIFICAÇÃO: Incluindo a coluna 'Detalhamento' aqui
                 dataframes_to_combine.append(
-                    planejamento_geral_df_filtrado[['Matrícula', 'Nome', 'Início', 'Término', 'Tipo', 'Detalhamento']]
+                    planejamento_geral_df_filtrado[['Matrícula', 'Nome', 'Início', 'Término', 'Tipo', 'Detalhamento']] # ALTERADO
                 )
         
         if not dataframes_to_combine:
             combined_df = pd.DataFrame(
-                columns=['Matrícula', 'Nome', 'Início', 'Término', 'Disciplina', 'Função', 'Projeto', 'Tipo', 'Detalhamento']
+                columns=['Matrícula', 'Nome', 'Início', 'Término', 'Disciplina', 'Função', 'Projeto', 'Tipo']
             )
         else:
             combined_df = pd.concat(dataframes_to_combine, ignore_index=True)
@@ -318,7 +309,7 @@ class DataProcessor:
         matricula_mapping = {row['Matrícula']: row for _, row in equipe_df.iterrows()}
         
         # Garantir que todas as colunas necessárias existem
-        for col in ['Disciplina', 'Função', 'Projeto', 'Detalhamento']:
+        for col in ['Disciplina', 'Função', 'Projeto']:
             if col not in combined_df.columns:
                 combined_df[col] = None
         
@@ -344,11 +335,7 @@ class DataProcessor:
         # Reordenar combined_df com a mesma lógica
         combined_df['Disciplina'] = combined_df['Disciplina'].astype(disciplinas_ordenadas)
         
-        # Adicionar coluna de nome completo
-        combined_df['Nome_Completo'] = combined_df.apply(
-            lambda row: f"{row['Nome']} ({row['Projeto'] if pd.notna(row['Projeto']) else 'Sem Projeto'})", 
-            axis=1
-        )
+        # O código de criação de Nome_Completo foi removido.
         
         return combined_df, unique_members
 
@@ -358,10 +345,10 @@ class Visualizer:
     
     @staticmethod
     def create_gantt_chart(combined_df_filtered: pd.DataFrame, 
-                            unique_members: pd.DataFrame, 
-                            start_date: pd.Timestamp, 
-                            end_date: pd.Timestamp,
-                            hoje: datetime.date) -> go.Figure:
+                           unique_members: pd.DataFrame, 
+                           start_date: pd.Timestamp, 
+                           end_date: pd.Timestamp,
+                           hoje: datetime.date) -> go.Figure:
         """
         Cria um gráfico de Gantt para visualização de alocação.
         
@@ -376,18 +363,16 @@ class Visualizer:
             Figura Plotly com o gráfico de Gantt.
         """
         # Crie a lista ordenada de rótulos do eixo Y com nome e projeto
-        y_order = [
-            f"{row['Nome']} ({row['Projeto'] if pd.notna(row['Projeto']) else 'Sem Projeto'})" 
-            for _, row in unique_members.iterrows()
-        ]
-        
+        # Agora, a lista de ordenação do eixo Y será baseada apenas na coluna 'Nome'
+        y_order = unique_members['Nome'].tolist()
+
         # Crie um dicionário com a cor para cada pessoa
+        # O dicionário foi ajustado para usar apenas o 'Nome' como chave
         cor_nomes_dict = {}
         for _, row in unique_members.iterrows():
-            nome_completo = f"{row['Nome']} ({row['Projeto'] if pd.notna(row['Projeto']) else 'Sem Projeto'})"
             disponivel = not DataProcessor.check_conflict(row, combined_df_filtered, start_date, end_date)
             cor = Config.COLOR_AVAILABLE if disponivel else Config.COLOR_UNAVAILABLE
-            cor_nomes_dict[nome_completo] = cor
+            cor_nomes_dict[row['Nome']] = cor
         
         # Crie os rótulos do eixo Y usando a formatação HTML com as cores
         y_ticktext_colored = [
@@ -400,19 +385,19 @@ class Visualizer:
             combined_df_filtered,
             x_start="Início",
             x_end="Término",
-            y="Nome_Completo",
+            y="Nome",
             color="Tipo",
-            # --- MODIFICAÇÃO: Incluindo a coluna 'Detalhamento' no hover_data
             hover_data={
+                "Nome": True,
+                "Detalhamento": True, # <-- ADICIONADO
                 "Início": "|%d/%m/%Y",
                 "Término": "|%d/%m/%Y",
                 "Tipo": True,
                 "Disciplina": True,
                 "Função": True,
-                "Projeto": True,
-                "Detalhamento": True, # Coluna adicionada para hover
+                "Projeto": True
             },
-            category_orders={"Nome_Completo": y_order}  # Forçar a ordem do eixo Y
+            category_orders={"Nome": y_order}
         )
         
         # Adicionar borda preta às barras
@@ -474,7 +459,7 @@ class Visualizer:
             annotation=dict(
                 font=dict(color=Config.COLOR_TODAY_LINE),
                 yref="paper",
-                y=1.025,  # Posiciona a anotação acima do gráfico
+                y=1.025, # Posiciona a anotação acima do gráfico
                 showarrow=False
             )
         )
@@ -509,12 +494,12 @@ class Visualizer:
                 fig.add_annotation(
                     # Coordenadas relativas ao "papel" do gráfico
                     xref="paper",
-                    yref="y",  # Mantém a referência do eixo Y para a posição vertical
-                    x=1,       # Posição X no extremo direito (1.0 = borda direita)
+                    yref="y", # Mantém a referência do eixo Y para a posição vertical
+                    x=1,      # Posição X no extremo direito (1.0 = borda direita)
                     y=y_legenda,
                     text=f"<b>{disc}</b>",
                     showarrow=False,
-                    xanchor="right",  # Alinha a borda direita da anotação com a posição x=1
+                    xanchor="right", # Alinha a borda direita da anotação com a posição x=1
                     yanchor="middle",
                     font=dict(size=14, color=Config.COLOR_SECTION_LINE)
                 )
@@ -599,18 +584,15 @@ class App:
                 (combined_df['Matrícula'].isin(matriculas_equipe))
             ].copy()
             
-            # Criar nome completo e ordenar
-            unique_members_with_completo = unique_members.apply(
-                lambda row: f"{row['Nome']} ({row['Projeto'] if pd.notna(row['Projeto']) else 'Sem Projeto'})", 
-                axis=1
-            ).tolist()
+            # Criar nome completo e ordenar (Este passo foi ajustado para usar apenas o 'Nome')
+            unique_members_list = unique_members['Nome'].tolist()
             
-            combined_df_filtered['Nome_Completo'] = pd.Categorical(
-                combined_df_filtered['Nome_Completo'], 
-                categories=unique_members_with_completo, 
+            combined_df_filtered['Nome'] = pd.Categorical(
+                combined_df_filtered['Nome'], 
+                categories=unique_members_list, 
                 ordered=True
             )
-            combined_df_filtered = combined_df_filtered.sort_values('Nome_Completo')
+            combined_df_filtered = combined_df_filtered.sort_values('Nome')
             
             # Criar visualização
             fig = Visualizer.create_gantt_chart(
