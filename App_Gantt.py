@@ -162,12 +162,20 @@ class DataLoader:
             DataFrame com dados de planejamento geral.
         """
         try:
+            # --- MODIFICAÇÃO: Incluindo a coluna 'Detalhamento'
             planejamento_geral_df = pd.read_excel(
                 Config.FILE_PATH_GERAL, 
-                usecols=["Nome", "Matrícula", "Início", "Término", "DIAS", "Atividade"]
+                usecols=["Nome", "Matrícula", "Início", "Término", "DIAS", "Atividade", "Detalhamento"]
             )
             
             planejamento_geral_df = planejamento_geral_df.rename(columns={'Atividade': 'Tipo'})
+            
+            # Tratamento para garantir que a coluna existe e preencher valores ausentes
+            if 'Detalhamento' not in planejamento_geral_df.columns:
+                planejamento_geral_df['Detalhamento'] = "Sem detalhamento"
+            else:
+                planejamento_geral_df['Detalhamento'] = planejamento_geral_df['Detalhamento'].fillna("Sem detalhamento")
+
             planejamento_geral_df[['Início', 'Término']] = planejamento_geral_df[['Início', 'Término']].apply(pd.to_datetime)
             
             return planejamento_geral_df
@@ -294,13 +302,14 @@ class DataProcessor:
                 planejamento_geral_df['Matrícula'].isin(equipe_df['Matrícula'])
             ].copy()
             if not planejamento_geral_df_filtrado.empty:
+                # --- MODIFICAÇÃO: Incluindo a coluna 'Detalhamento' aqui
                 dataframes_to_combine.append(
-                    planejamento_geral_df_filtrado[['Matrícula', 'Nome', 'Início', 'Término', 'Tipo']]
+                    planejamento_geral_df_filtrado[['Matrícula', 'Nome', 'Início', 'Término', 'Tipo', 'Detalhamento']]
                 )
         
         if not dataframes_to_combine:
             combined_df = pd.DataFrame(
-                columns=['Matrícula', 'Nome', 'Início', 'Término', 'Disciplina', 'Função', 'Projeto', 'Tipo']
+                columns=['Matrícula', 'Nome', 'Início', 'Término', 'Disciplina', 'Função', 'Projeto', 'Tipo', 'Detalhamento']
             )
         else:
             combined_df = pd.concat(dataframes_to_combine, ignore_index=True)
@@ -309,7 +318,7 @@ class DataProcessor:
         matricula_mapping = {row['Matrícula']: row for _, row in equipe_df.iterrows()}
         
         # Garantir que todas as colunas necessárias existem
-        for col in ['Disciplina', 'Função', 'Projeto']:
+        for col in ['Disciplina', 'Função', 'Projeto', 'Detalhamento']:
             if col not in combined_df.columns:
                 combined_df[col] = None
         
@@ -349,10 +358,10 @@ class Visualizer:
     
     @staticmethod
     def create_gantt_chart(combined_df_filtered: pd.DataFrame, 
-                           unique_members: pd.DataFrame, 
-                           start_date: pd.Timestamp, 
-                           end_date: pd.Timestamp,
-                           hoje: datetime.date) -> go.Figure:
+                            unique_members: pd.DataFrame, 
+                            start_date: pd.Timestamp, 
+                            end_date: pd.Timestamp,
+                            hoje: datetime.date) -> go.Figure:
         """
         Cria um gráfico de Gantt para visualização de alocação.
         
@@ -393,13 +402,15 @@ class Visualizer:
             x_end="Término",
             y="Nome_Completo",
             color="Tipo",
+            # --- MODIFICAÇÃO: Incluindo a coluna 'Detalhamento' no hover_data
             hover_data={
                 "Início": "|%d/%m/%Y",
                 "Término": "|%d/%m/%Y",
                 "Tipo": True,
                 "Disciplina": True,
                 "Função": True,
-                "Projeto": True
+                "Projeto": True,
+                "Detalhamento": True, # Coluna adicionada para hover
             },
             category_orders={"Nome_Completo": y_order}  # Forçar a ordem do eixo Y
         )
@@ -477,8 +488,7 @@ class Visualizer:
             line_width=0,
         )
 
-        
-# Adicionar bordas para as disciplinas e suas legendas na ordem correta
+        # Adicionar bordas para as disciplinas e suas legendas na ordem correta
         y_posicao_atual = 0.0
         for disc in reversed(Config.DISCIPLINA_ORDER): # Mudando a ordem para mostrar ELET no topo
             members_da_disciplina = unique_members[unique_members['Disciplina'] == disc]
