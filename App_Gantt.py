@@ -35,6 +35,17 @@ class Config:
     COLOR_AVAILABLE = "green"
     COLOR_UNAVAILABLE = "black"
     COLOR_SECTION_LINE = "black"
+    
+    # Mapeamento de cores para os tipos de atividades
+    COLOR_MAP = {
+        'Estaleiro': 'blue',
+        'Férias': 'red',
+        'Folga': 'red',
+        'Treinamento':'orange',
+        'Embarque':'orange',
+        'Workshop':'orange',
+        'Visita Técnica':'orange'
+    }
 
     # Ordem das disciplinas (adicionado aqui para fácil acesso)
     DISCIPLINA_ORDER = ["ELET", "INST", "MEC"]
@@ -116,10 +127,10 @@ class DataLoader:
             ]
             
             # Selecionar colunas relevantes
-            colunas_indices = [0, 1, 8, 9, 11, 12, 14, 15]
+            colunas_indices = [0, 8, 9, 11, 12, 14, 15]
             df_selecionado = df_ferias.iloc[:, colunas_indices]
             df_selecionado.columns = [
-                "Matrícula", "Nome do Empregado",
+                "Matrícula",
                 "Primeira Parcela", "Termino Primeira Parcela",
                 "Segunda Parcela", "Termino Segunda Parcela",
                 "Terceira Parcela", "Termino Terceira Parcela"
@@ -133,7 +144,7 @@ class DataLoader:
                 ("Segunda Parcela", "Termino Segunda Parcela"),
                 ("Terceira Parcela", "Termino Terceira Parcela")
             ]:
-                df_parcela = df_selecionado[["Matrícula", "Nome do Empregado", parcela, termino]].dropna(subset=[parcela])
+                df_parcela = df_selecionado[["Matrícula", parcela, termino]].dropna(subset=[parcela])
                 df_parcela = df_parcela.rename(columns={parcela: "Início", termino: "Término"})
                 df_parcela["Tipo"] = "Férias"
                 parcelas.append(df_parcela)
@@ -164,7 +175,7 @@ class DataLoader:
         try:
             planejamento_geral_df = pd.read_excel(
                 Config.FILE_PATH_GERAL, 
-                usecols=["Nome", "Matrícula", "Início", "Término", "DIAS", "Atividade", "Detalhamento"] # ALTERADO
+                usecols=["Nome", "Matrícula", "Início", "Término", "DIAS", "Atividade", "Detalhamento"]
             )
             
             planejamento_geral_df = planejamento_geral_df.rename(columns={'Atividade': 'Tipo'})
@@ -283,11 +294,16 @@ class DataProcessor:
             ferias_df_filtrado = ferias_df[
                 ferias_df['Matrícula'].isin(equipe_df['Matrícula'])
             ].copy()
+            
+            # ATENÇÃO: Corrigindo aqui para pegar o nome da aba Equipe
             if not ferias_df_filtrado.empty:
-                ferias_renamed = ferias_df_filtrado[['Matrícula', 'Nome do Empregado', 'Início', 'Término', 'Tipo']].rename(
-                    columns={'Nome do Empregado': 'Nome'}
+                ferias_com_nome = pd.merge(
+                    ferias_df_filtrado, 
+                    equipe_df[['Matrícula', 'Nome']],
+                    on='Matrícula', 
+                    how='left'
                 )
-                dataframes_to_combine.append(ferias_renamed)
+                dataframes_to_combine.append(ferias_com_nome[['Matrícula', 'Nome', 'Início', 'Término', 'Tipo']])
         
         if planejamento_geral_df is not None:
             planejamento_geral_df_filtrado = planejamento_geral_df[
@@ -295,7 +311,7 @@ class DataProcessor:
             ].copy()
             if not planejamento_geral_df_filtrado.empty:
                 dataframes_to_combine.append(
-                    planejamento_geral_df_filtrado[['Matrícula', 'Nome', 'Início', 'Término', 'Tipo', 'Detalhamento']] # ALTERADO
+                    planejamento_geral_df_filtrado[['Matrícula', 'Nome', 'Início', 'Término', 'Tipo', 'Detalhamento']]
                 )
         
         if not dataframes_to_combine:
@@ -333,9 +349,8 @@ class DataProcessor:
         ).reset_index(drop=True)
 
         # Reordenar combined_df com a mesma lógica
-        combined_df['Disciplina'] = combined_df['Disciplina'].astype(disciplinas_ordenadas)
-        
-        # O código de criação de Nome_Completo foi removido.
+        if 'Disciplina' in combined_df.columns:
+            combined_df['Disciplina'] = combined_df['Disciplina'].astype(disciplinas_ordenadas)
         
         return combined_df, unique_members
 
@@ -363,11 +378,9 @@ class Visualizer:
             Figura Plotly com o gráfico de Gantt.
         """
         # Crie a lista ordenada de rótulos do eixo Y com nome e projeto
-        # Agora, a lista de ordenação do eixo Y será baseada apenas na coluna 'Nome'
         y_order = unique_members['Nome'].tolist()
 
         # Crie um dicionário com a cor para cada pessoa
-        # O dicionário foi ajustado para usar apenas o 'Nome' como chave
         cor_nomes_dict = {}
         for _, row in unique_members.iterrows():
             disponivel = not DataProcessor.check_conflict(row, combined_df_filtered, start_date, end_date)
@@ -387,9 +400,10 @@ class Visualizer:
             x_end="Término",
             y="Nome",
             color="Tipo",
+            color_discrete_map=Config.COLOR_MAP,
             hover_data={
                 "Nome": True,
-                "Detalhamento": True, # <-- ADICIONADO
+                "Detalhamento": True,
                 "Início": "|%d/%m/%Y",
                 "Término": "|%d/%m/%Y",
                 "Tipo": True,
@@ -584,7 +598,7 @@ class App:
                 (combined_df['Matrícula'].isin(matriculas_equipe))
             ].copy()
             
-            # Criar nome completo e ordenar (Este passo foi ajustado para usar apenas o 'Nome')
+            # Criar nome completo e ordenar
             unique_members_list = unique_members['Nome'].tolist()
             
             combined_df_filtered['Nome'] = pd.Categorical(
@@ -593,7 +607,7 @@ class App:
                 ordered=True
             )
             combined_df_filtered = combined_df_filtered.sort_values('Nome')
-            
+
             # Criar visualização
             fig = Visualizer.create_gantt_chart(
                 combined_df_filtered, unique_members, 
