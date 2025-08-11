@@ -389,9 +389,10 @@ class Visualizer:
         
         # Crie os rótulos do eixo Y usando a formatação HTML com as cores
         y_ticktext_colored = [
-            f'<span style="color:{cor_nomes_dict.get(nome, "black")}">{nome}</span>' 
+            f'<span style="color:{cor_nomes_dict.get(nome, "black")}"><b>{nome}</b></span>' if cor_nomes_dict.get(nome) == Config.COLOR_AVAILABLE
+            else f'<span style="color:{cor_nomes_dict.get(nome, "black")}">{nome}</span>'
             for nome in y_order
-        ]
+]
         
         # Crie o gráfico de Gantt com Plotly Express
         fig = px.timeline(
