@@ -563,18 +563,12 @@ class App:
                 default=projetos_unicos
             )
             
-            data_inicio_analise = st.sidebar.date_input(
-                "Data Início Análise", 
-                value=self.hoje - timedelta(days=Config.DEFAULT_LOOKBACK_DAYS)
-            )
-            data_fim_analise = st.sidebar.date_input(
-                "Data Fim Análise", 
-                value=self.hoje + timedelta(days=Config.DEFAULT_LOOKAHEAD_DAYS)
-            )
+            # Automatically set to current week's Monday–Friday
+            monday = self.hoje - timedelta(days=self.hoje.weekday())
+            friday = monday + timedelta(days=4)
 
-            # Converter para timestamp
-            data_inicio_analise = pd.Timestamp(data_inicio_analise)
-            data_fim_analise = pd.Timestamp(data_fim_analise)
+            data_inicio_analise = pd.Timestamp(monday)
+            data_fim_analise = pd.Timestamp(friday)
             
             # Aplicar os filtros ao DataFrame da equipe
             equipe_df_filtrada = equipe_df[
