@@ -35,6 +35,17 @@ class Config:
     COLOR_AVAILABLE = "green"
     COLOR_UNAVAILABLE = "black"
     COLOR_SECTION_LINE = "black"
+    
+    # Mapeamento de cores para os tipos de atividades
+    COLOR_MAP = {
+        'Estaleiro': 'blue',
+        'Férias': 'red',
+        'Folga': 'red',
+        'Treinamento':'orange',
+        'Embarque':'orange',
+        'Workshop':'orange',
+        'Visita Técnica':'orange'
+    }
 
     # Ordem das disciplinas (adicionado aqui para fácil acesso)
     DISCIPLINA_ORDER = ["ELET", "INST", "MEC"]
@@ -116,10 +127,10 @@ class DataLoader:
             ]
             
             # Selecionar colunas relevantes
-            colunas_indices = [0, 1, 8, 9, 11, 12, 14, 15]
+            colunas_indices = [0, 8, 9, 11, 12, 14, 15]
             df_selecionado = df_ferias.iloc[:, colunas_indices]
             df_selecionado.columns = [
-                "Matrícula", "Nome do Empregado",
+                "Matrícula",
                 "Primeira Parcela", "Termino Primeira Parcela",
                 "Segunda Parcela", "Termino Segunda Parcela",
                 "Terceira Parcela", "Termino Terceira Parcela"
@@ -133,7 +144,7 @@ class DataLoader:
                 ("Segunda Parcela", "Termino Segunda Parcela"),
                 ("Terceira Parcela", "Termino Terceira Parcela")
             ]:
-                df_parcela = df_selecionado[["Matrícula", "Nome do Empregado", parcela, termino]].dropna(subset=[parcela])
+                df_parcela = df_selecionado[["Matrícula", parcela, termino]].dropna(subset=[parcela])
                 df_parcela = df_parcela.rename(columns={parcela: "Início", termino: "Término"})
                 df_parcela["Tipo"] = "Férias"
                 parcelas.append(df_parcela)
@@ -164,7 +175,7 @@ class DataLoader:
         try:
             planejamento_geral_df = pd.read_excel(
                 Config.FILE_PATH_GERAL, 
-                usecols=["Nome", "Matrícula", "Início", "Término", "DIAS", "Atividade"]
+                usecols=["Nome", "Matrícula", "Início", "Término", "DIAS", "Atividade", "Detalhamento"]
             )
             
             planejamento_geral_df = planejamento_geral_df.rename(columns={'Atividade': 'Tipo'})
@@ -185,7 +196,7 @@ class DataProcessor:
     
     @staticmethod
     def check_conflict(row: pd.Series, combined_df: pd.DataFrame, 
-                         start_date: pd.Timestamp, end_date: pd.Timestamp) -> bool:
+                       start_date: pd.Timestamp, end_date: pd.Timestamp) -> bool:
         """
         Verifica se há conflitos de agenda para uma pessoa em um período específico.
         
@@ -283,11 +294,16 @@ class DataProcessor:
             ferias_df_filtrado = ferias_df[
                 ferias_df['Matrícula'].isin(equipe_df['Matrícula'])
             ].copy()
+            
+            # ATENÇÃO: Corrigindo aqui para pegar o nome da aba Equipe
             if not ferias_df_filtrado.empty:
-                ferias_renamed = ferias_df_filtrado[['Matrícula', 'Nome do Empregado', 'Início', 'Término', 'Tipo']].rename(
-                    columns={'Nome do Empregado': 'Nome'}
+                ferias_com_nome = pd.merge(
+                    ferias_df_filtrado, 
+                    equipe_df[['Matrícula', 'Nome']],
+                    on='Matrícula', 
+                    how='left'
                 )
-                dataframes_to_combine.append(ferias_renamed)
+                dataframes_to_combine.append(ferias_com_nome[['Matrícula', 'Nome', 'Início', 'Término', 'Tipo']])
         
         if planejamento_geral_df is not None:
             planejamento_geral_df_filtrado = planejamento_geral_df[
@@ -295,7 +311,7 @@ class DataProcessor:
             ].copy()
             if not planejamento_geral_df_filtrado.empty:
                 dataframes_to_combine.append(
-                    planejamento_geral_df_filtrado[['Matrícula', 'Nome', 'Início', 'Término', 'Tipo']]
+                    planejamento_geral_df_filtrado[['Matrícula', 'Nome', 'Início', 'Término', 'Tipo', 'Detalhamento']]
                 )
         
         if not dataframes_to_combine:
@@ -333,13 +349,8 @@ class DataProcessor:
         ).reset_index(drop=True)
 
         # Reordenar combined_df com a mesma lógica
-        combined_df['Disciplina'] = combined_df['Disciplina'].astype(disciplinas_ordenadas)
-        
-        # Adicionar coluna de nome completo
-        combined_df['Nome_Completo'] = combined_df.apply(
-            lambda row: f"{row['Nome']} ({row['Projeto'] if pd.notna(row['Projeto']) else 'Sem Projeto'})", 
-            axis=1
-        )
+        if 'Disciplina' in combined_df.columns:
+            combined_df['Disciplina'] = combined_df['Disciplina'].astype(disciplinas_ordenadas)
         
         return combined_df, unique_members
 
@@ -367,18 +378,14 @@ class Visualizer:
             Figura Plotly com o gráfico de Gantt.
         """
         # Crie a lista ordenada de rótulos do eixo Y com nome e projeto
-        y_order = [
-            f"{row['Nome']} ({row['Projeto'] if pd.notna(row['Projeto']) else 'Sem Projeto'})" 
-            for _, row in unique_members.iterrows()
-        ]
-        
+        y_order = unique_members['Nome'].tolist()
+
         # Crie um dicionário com a cor para cada pessoa
         cor_nomes_dict = {}
         for _, row in unique_members.iterrows():
-            nome_completo = f"{row['Nome']} ({row['Projeto'] if pd.notna(row['Projeto']) else 'Sem Projeto'})"
             disponivel = not DataProcessor.check_conflict(row, combined_df_filtered, start_date, end_date)
             cor = Config.COLOR_AVAILABLE if disponivel else Config.COLOR_UNAVAILABLE
-            cor_nomes_dict[nome_completo] = cor
+            cor_nomes_dict[row['Nome']] = cor
         
         # Crie os rótulos do eixo Y usando a formatação HTML com as cores
         y_ticktext_colored = [
@@ -391,9 +398,12 @@ class Visualizer:
             combined_df_filtered,
             x_start="Início",
             x_end="Término",
-            y="Nome_Completo",
+            y="Nome",
             color="Tipo",
+            color_discrete_map=Config.COLOR_MAP,
             hover_data={
+                "Nome": True,
+                "Detalhamento": True,
                 "Início": "|%d/%m/%Y",
                 "Término": "|%d/%m/%Y",
                 "Tipo": True,
@@ -401,7 +411,7 @@ class Visualizer:
                 "Função": True,
                 "Projeto": True
             },
-            category_orders={"Nome_Completo": y_order}  # Forçar a ordem do eixo Y
+            category_orders={"Nome": y_order}
         )
         
         # Adicionar borda preta às barras
@@ -463,7 +473,7 @@ class Visualizer:
             annotation=dict(
                 font=dict(color=Config.COLOR_TODAY_LINE),
                 yref="paper",
-                y=1.025,  # Posiciona a anotação acima do gráfico
+                y=1.025, # Posiciona a anotação acima do gráfico
                 showarrow=False
             )
         )
@@ -477,8 +487,7 @@ class Visualizer:
             line_width=0,
         )
 
-        
-# Adicionar bordas para as disciplinas e suas legendas na ordem correta
+        # Adicionar bordas para as disciplinas e suas legendas na ordem correta
         y_posicao_atual = 0.0
         for disc in reversed(Config.DISCIPLINA_ORDER): # Mudando a ordem para mostrar ELET no topo
             members_da_disciplina = unique_members[unique_members['Disciplina'] == disc]
@@ -499,12 +508,12 @@ class Visualizer:
                 fig.add_annotation(
                     # Coordenadas relativas ao "papel" do gráfico
                     xref="paper",
-                    yref="y",  # Mantém a referência do eixo Y para a posição vertical
-                    x=1,       # Posição X no extremo direito (1.0 = borda direita)
+                    yref="y", # Mantém a referência do eixo Y para a posição vertical
+                    x=1,      # Posição X no extremo direito (1.0 = borda direita)
                     y=y_legenda,
                     text=f"<b>{disc}</b>",
                     showarrow=False,
-                    xanchor="right",  # Alinha a borda direita da anotação com a posição x=1
+                    xanchor="right", # Alinha a borda direita da anotação com a posição x=1
                     yanchor="middle",
                     font=dict(size=14, color=Config.COLOR_SECTION_LINE)
                 )
@@ -590,18 +599,15 @@ class App:
             ].copy()
             
             # Criar nome completo e ordenar
-            unique_members_with_completo = unique_members.apply(
-                lambda row: f"{row['Nome']} ({row['Projeto'] if pd.notna(row['Projeto']) else 'Sem Projeto'})", 
-                axis=1
-            ).tolist()
+            unique_members_list = unique_members['Nome'].tolist()
             
-            combined_df_filtered['Nome_Completo'] = pd.Categorical(
-                combined_df_filtered['Nome_Completo'], 
-                categories=unique_members_with_completo, 
+            combined_df_filtered['Nome'] = pd.Categorical(
+                combined_df_filtered['Nome'], 
+                categories=unique_members_list, 
                 ordered=True
             )
-            combined_df_filtered = combined_df_filtered.sort_values('Nome_Completo')
-            
+            combined_df_filtered = combined_df_filtered.sort_values('Nome')
+
             # Criar visualização
             fig = Visualizer.create_gantt_chart(
                 combined_df_filtered, unique_members, 
