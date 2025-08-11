@@ -563,13 +563,26 @@ class App:
                 default=projetos_unicos
             )
             
-            # Automatically set to current week's Monday–Friday
-            monday = self.hoje - timedelta(days=self.hoje.weekday())
+            today = pd.Timestamp(self.hoje)
+
+            # If weekend, jump to next Monday
+            if today.weekday() >= 5:  # Saturday = 5, Sunday = 6
+                monday = today + timedelta(days=(7 - today.weekday()))
+            else:
+                monday = today - timedelta(days=today.weekday())
+
+            # Calculate Friday
             friday = monday + timedelta(days=4)
 
-            data_inicio_analise = pd.Timestamp(monday)
-            data_fim_analise = pd.Timestamp(friday)
-            
+            # Sidebar date pickers with defaults
+            data_inicio_analise = st.sidebar.date_input("Data Início Análise", value=monday)
+            data_fim_analise = st.sidebar.date_input("Data Fim Análise", value=friday)
+
+            # Convert to pandas Timestamp
+            data_inicio_analise = pd.Timestamp(data_inicio_analise)
+            data_fim_analise = pd.Timestamp(data_fim_analise)
+
+
             # Aplicar os filtros ao DataFrame da equipe
             equipe_df_filtrada = equipe_df[
                 (equipe_df['Disciplina'].isin(disciplinas_selecionadas)) &
