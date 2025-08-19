@@ -531,7 +531,6 @@ class Visualizer:
                 y_posicao_atual = ultima_posicao
 
         return fig
-
 class App:
     """Classe principal da aplicação Streamlit."""
 
@@ -591,6 +590,12 @@ class App:
             data_inicio_analise = pd.Timestamp(data_inicio_analise)
             data_fim_analise = pd.Timestamp(data_fim_analise)
 
+            # A new filter for available people
+            show_available_only = st.sidebar.checkbox(
+                "Exibir Apenas Pessoas Disponíveis",
+                value=False,
+                help="Filtra a lista para mostrar somente as pessoas que não têm alocações no período de análise."
+            )
 
             # Aplicar os filtros ao DataFrame da equipe
             equipe_df_filtrada = equipe_df[
@@ -598,15 +603,33 @@ class App:
                 (equipe_df['Projeto'].isin(projetos_selecionados))
             ].copy()
 
+            # Preparar dados combinados antes de aplicar o filtro de disponibilidade
+            combined_df, _ = DataProcessor.prepare_combined_data(
+                equipe_df_filtrada, planejamento_df, df_ferias_final, planejamento_geral_df
+            )
+
+            # Implement the filter for available people
+            if show_available_only:
+                disponivel_df = equipe_df_filtrada.copy()
+                disponivel_df['Disponivel'] = disponivel_df.apply(
+                    lambda row: not DataProcessor.check_conflict(row, combined_df, data_inicio_analise, data_fim_analise),
+                    axis=1
+                )
+                equipe_df_filtrada = disponivel_df[disponivel_df['Disponivel']].copy()
+                # Recalculate unique_members based on the new filtered DataFrame
+                _, unique_members = DataProcessor.prepare_combined_data(
+                    equipe_df_filtrada, planejamento_df, df_ferias_final, planejamento_geral_df
+                )
+            else:
+                # If the filter is not active, use the data prepared before the availability check
+                _, unique_members = DataProcessor.prepare_combined_data(
+                    equipe_df_filtrada, planejamento_df, df_ferias_final, planejamento_geral_df
+                )
+
             # Verificar se o DataFrame filtrado não está vazio antes de continuar
             if equipe_df_filtrada.empty:
                 st.warning("Nenhum membro da equipe corresponde aos filtros selecionados. Por favor, ajuste suas seleções.")
                 return
-
-            # Preparar dados combinados
-            combined_df, unique_members = DataProcessor.prepare_combined_data(
-                equipe_df_filtrada, planejamento_df, df_ferias_final, planejamento_geral_df
-            )
 
             # Filtrar e ordenar dados
             matriculas_equipe = unique_members['Matrícula'].unique()
@@ -643,7 +666,6 @@ class App:
                 st.warning(f"```\n{conflitos_texto}\n```")
         else:
             st.warning("Não foi possível carregar os dados. Verifique se os arquivos Excel estão presentes e corretos.")
-
 
 if __name__ == "__main__":
     app = App()
