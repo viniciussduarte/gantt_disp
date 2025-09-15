@@ -152,15 +152,21 @@ class DataLoader:
             # Concatenar as parcelas de férias
             df_ferias_final = pd.concat(parcelas, ignore_index=True)
 
-            # --- APLICAÇÃO DA CORREÇÃO AQUI ---
-            # Converte o número de série do Excel para data,
-            # usando a origem de data correta do Excel
-            df_ferias_final['Início'] = pd.to_datetime(
-                df_ferias_final['Início'], unit='D', origin='1899-12-30', errors='coerce'
-            )
-            df_ferias_final['Término'] = pd.to_datetime(
-                df_ferias_final['Término'], unit='D', origin='1899-12-30', errors='coerce'
-            )
+            # Primeiro, verificar se os dados são numéricos ou já são datetime
+            def safe_convert_to_datetime(series):
+                """Converte uma série para datetime, tratando tanto números quanto datas"""
+                if pd.api.types.is_datetime64_any_dtype(series):
+                    # Se já é datetime, apenas retorna
+                    return series
+                elif pd.api.types.is_numeric_dtype(series):
+                    # Se é numérico, converte do formato Excel
+                    return pd.to_datetime(series, unit='D', origin='1899-12-30', errors='coerce')
+                else:
+                    # Tenta conversão padrão
+                    return pd.to_datetime(series, errors='coerce')
+
+            df_ferias_final['Início'] = safe_convert_to_datetime(df_ferias_final['Início'])
+            df_ferias_final['Término'] = safe_convert_to_datetime(df_ferias_final['Término'])
 
             return df_ferias_final
 
