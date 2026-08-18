@@ -82,7 +82,8 @@ class DataLoader:
 
     @staticmethod
     def _to_matricula(series: pd.Series) -> pd.Series:
-        return pd.to_numeric(series, errors="coerce").astype("Int64")
+        numeric = pd.to_numeric(series, errors="coerce")
+        return numeric.apply(lambda x: str(int(x)) if pd.notna(x) else pd.NA)
 
     @staticmethod
     def _download_from_drive(file_id: str, dest_path: str) -> bool:
@@ -200,6 +201,35 @@ class DataLoader:
 
     @staticmethod
     @st.cache_data(ttl=3600, show_spinner="Baixando Planejamento Geral do Google Drive...")
+    def load_geral_equipe_data() -> Optional[pd.DataFrame]:
+        if not DataLoader._ensure_drive_file("Planejamento Geral.xlsx", Config.FILE_PATH_GERAL):
+            st.error("Não foi possível obter o Planejamento Geral (nem do Drive nem local).")
+            return None
+        try:
+            equipe_df = pd.read_excel(Config.FILE_PATH_GERAL, sheet_name="Equipe")
+            keep = ["Disciplina", "Matrícula", "Função", "Projeto", "Experiência", "Nome", "E-mail"]
+            keep = [c for c in keep if c in equipe_df.columns]
+            equipe_df = equipe_df[keep].copy()
+
+            equipe_df = equipe_df.dropna(subset=["Nome", "Matrícula"])
+            equipe_df["Matrícula"] = DataLoader._to_matricula(equipe_df["Matrícula"])
+            equipe_df = equipe_df.dropna(subset=["Matrícula"])
+
+            for c in ["Disciplina", "Função", "Projeto", "Experiência", "E-mail"]:
+                if c in equipe_df.columns:
+                    equipe_df[c] = equipe_df[c].astype("string")
+            equipe_df["Nome"] = equipe_df["Nome"].astype("string").str.strip().str.upper()
+            for c in ["Disciplina", "Função", "Projeto", "Experiência"]:
+                if c in equipe_df.columns:
+                    equipe_df[c] = equipe_df[c].str.strip().str.upper()
+
+            return equipe_df
+        except Exception as e:
+            st.error(f"Erro ao carregar a aba Equipe do Planejamento Geral: {e}")
+            return None
+
+    @staticmethod
+    @st.cache_data(ttl=3600, show_spinner="Baixando Planejamento Geral do Google Drive...")
     def load_planejamento_geral() -> Optional[pd.DataFrame]:
         if not DataLoader._ensure_drive_file("Planejamento Geral.xlsx", Config.FILE_PATH_GERAL):
             st.error("Não foi possível obter o Planejamento Geral (nem do Drive nem local).")
@@ -226,17 +256,21 @@ class DataProcessor:
     """Combinação de fontes, cálculo de disponibilidade e detecção de conflitos."""
 
     @staticmethod
+    def _mat_set(series: pd.Series) -> Set:
+        return set(series.dropna().astype(str))
+
+    @staticmethod
     def prepare_combined_data(
         equipe_df: pd.DataFrame,
         dfs_eventos: List[Optional[pd.DataFrame]],
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         valid_dfs = []
-        matriculas_validas = set(equipe_df["Matrícula"].dropna())
+        matriculas_validas = DataProcessor._mat_set(equipe_df["Matrícula"])
 
         for df in dfs_eventos:
             if df is None or df.empty:
                 continue
-            df = df[df["Matrícula"].isin(matriculas_validas)].copy()
+            df = df[df["Matrícula"].astype(str).isin(matriculas_validas)].copy()
             cols = ["Matrícula", "Início", "Término", "Tipo"]
             for extra in ["Nome", "Detalhamento", "Plataforma"]:
                 if extra in df.columns:
@@ -284,10 +318,10 @@ class DataProcessor:
         end_date: pd.Timestamp,
     ) -> Set:
         if combined_df.empty:
-            return set(unique_members["Matrícula"])
+            return DataProcessor._mat_set(unique_members["Matrícula"])
         mask = (combined_df["Início"] <= end_date) & (combined_df["Término"] >= start_date)
-        occupied = set(combined_df.loc[mask, "Matrícula"].dropna())
-        return set(unique_members["Matrícula"]) - occupied
+        occupied = DataProcessor._mat_set(combined_df.loc[mask, "Matrícula"])
+        return DataProcessor._mat_set(unique_members["Matrícula"]) - occupied
 
     @staticmethod
     def occupied_in_period(
@@ -298,7 +332,7 @@ class DataProcessor:
         if combined_df.empty:
             return set()
         mask = (combined_df["Início"] <= end_date) & (combined_df["Término"] >= start_date)
-        return set(combined_df.loc[mask, "Matrícula"].dropna())
+        return DataProcessor._mat_set(combined_df.loc[mask, "Matrícula"])
 
     @staticmethod
     def events_in_period(
@@ -446,6 +480,17 @@ class Visualizer:
                     showlegend=True,
                 ))
 
+        if len(fig.data) == 0:
+            fig.add_trace(go.Scatter(
+                y=list(range(len(names))),
+                x=[0] * len(names),
+                mode="markers",
+                marker=dict(opacity=0, size=0),
+                showlegend=False,
+                hoverinfo="skip",
+                hovertemplate=None,
+            ))
+
         x0 = start_date - pd.Timedelta(days=1)
         x1 = end_date + pd.Timedelta(days=4)
 
@@ -525,7 +570,7 @@ class Visualizer:
             bargroupgap=0,
             plot_bgcolor="white",
             paper_bgcolor="white",
-            margin=dict(l=8, r=8, t=46, b=40),
+            margin=dict(l=8, r=8, t=60, b=50),
             title=dict(text="Cronograma de Alocação", x=0.01, xanchor="left", font=dict(size=16, color="#0f172a")),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, title="Atividade"),
             hovermode="closest",
@@ -544,7 +589,7 @@ class Visualizer:
             yaxis=dict(
                 categoryorder="array",
                 categoryarray=names,
-                autorange="reversed",
+                range=[len(names) - 0.5, -0.5],
                 tickmode="array",
                 tickvals=list(range(len(names))),
                 ticktext=y_ticktext,
@@ -579,18 +624,26 @@ class App:
                 st.cache_data.clear()
                 st.rerun()
 
-            equipe_df, plan_df = DataLoader.load_estaleiro_data()
+            equipe_df = DataLoader.load_geral_equipe_data()
+            _, plan_df = DataLoader.load_estaleiro_data()
             ferias_df = DataLoader.load_ferias_data()
             geral_df = DataLoader.load_planejamento_geral()
 
             if equipe_df is None:
-                st.error("Falha ao carregar o arquivo principal (Planejamento Estaleiro).")
+                st.error("Falha ao carregar a aba Equipe do Planejamento Geral.")
                 return
 
             all_discs = sorted([x for x in equipe_df["Disciplina"].dropna().unique()])
             sel_discs = st.multiselect("Disciplina", all_discs, default=all_discs)
             all_projs = sorted([x for x in equipe_df["Projeto"].dropna().unique()])
             sel_projs = st.multiselect("Projeto", all_projs, default=all_projs)
+
+            funcao_map = {"SUPERVISOR": "LIDERANÇA", "COORDENADOR": "LIDERANÇA"}
+            equipe_df["FunçãoAgrupada"] = equipe_df["Função"].map(
+                lambda f: funcao_map.get(f, f) if pd.notna(f) else f
+            )
+            all_funcoes = sorted([x for x in equipe_df["FunçãoAgrupada"].dropna().unique()])
+            sel_funcoes = st.multiselect("Função", all_funcoes, default=all_funcoes)
 
             preset = st.selectbox("Período", list(Config.DATE_PRESETS.keys()), index=1)
             dias = Config.DATE_PRESETS[preset]
@@ -615,6 +668,7 @@ class App:
         equipe_filtered = equipe_df[
             equipe_df["Disciplina"].isin(sel_discs)
             & equipe_df["Projeto"].isin(sel_projs)
+            & equipe_df["FunçãoAgrupada"].isin(sel_funcoes)
         ].copy()
 
         if equipe_filtered.empty:
@@ -653,7 +707,9 @@ class App:
 
         display_members = unique_members.copy()
         if only_available:
-            display_members = display_members[display_members["Matrícula"].isin(familiar_available)].reset_index(drop=True)
+            display_members = display_members[
+                display_members["Matrícula"].astype(str).isin(familiar_available)
+            ].reset_index(drop=True)
 
         if display_members.empty:
             st.info("Nenhum colaborador disponível para os critérios selecionados.")
@@ -670,7 +726,8 @@ class App:
             y_ticktext = []
             for _, row in display_members.iterrows():
                 nome = str(row["Nome"])
-                if pd.notna(row["Matrícula"]) and int(row["Matrícula"]) in familiar_available:
+                mat_str = str(int(row["Matrícula"])) if pd.notna(row["Matrícula"]) else None
+                if mat_str is not None and mat_str in familiar_available:
                     y_ticktext.append(f'<span style="color:#10B981;font-weight:bold">{nome}</span>')
                 else:
                     y_ticktext.append(f'<span style="color:#EF4444;font-weight:bold">{nome}</span>')
@@ -688,7 +745,7 @@ class App:
         with tab_equipe:
             status_rows = display_members.copy()
             status_rows["Status no período"] = status_rows["Matrícula"].map(
-                lambda m: "Disponível" if m in familiar_available else "Ocupado"
+                lambda m: "Disponível" if str(int(m)) in familiar_available else "Ocupado" if pd.notna(m) else "—"
             )
             show_cols = [c for c in [
                 "Nome", "Disciplina", "Função", "Projeto", "E-mail", "Matrícula", "Status no período"
