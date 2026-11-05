@@ -685,15 +685,15 @@ class App:
     def __init__(self):
         st.set_page_config(
             layout="wide",
-            page_title="Gestão de Alocação & Escalas v0.1",
+            page_title="Gestão de Alocação & Escalas v0.2",
             page_icon="📊",
             initial_sidebar_state="expanded",
         )
         self.hoje = datetime.today().date()
 
     def run(self):
-        st.title("🚢 Painel de Disponibilidade e Escalas de Plataforma — v0.1")
-        st.caption("Visualização integrada de Estaleiro, Férias, Planejamento Geral e Escalas P-80, P-82 e P-83 (v0.1).")
+        st.title("🚢 Painel de Disponibilidade e Escalas de Plataforma — v0.2")
+        st.caption("Visualização integrada de Estaleiro, Férias, Planejamento Geral e Escalas P-80, P-82 e P-83 (v0.2).")
 
         with st.sidebar:
             st.header("Filtros")

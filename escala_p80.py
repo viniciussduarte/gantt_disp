@@ -1343,7 +1343,7 @@ class EscalaP80DB:
         return True
 
 
-# --- INTEGRAÇÃO COM DADOS DO CRONOGRAMA & DETECÇÃO DE CONFLITOS (v0.1) -------
+# --- INTEGRAÇÃO COM DADOS DO CRONOGRAMA & DETECÇÃO DE CONFLITOS (v0.2) -------
 def integrar_escalas_com_cronograma(
     escalas_map: Dict[Tuple[str, str], str],
     mapa_dia_periodo: Dict[Tuple[str, str], Dict],
@@ -2599,7 +2599,7 @@ def build_scala_html(
             </div>
             <div class="p80-modal-foot">
                 <button type="button" class="p80-btn p80-btn-cancel" onclick="fecharModalEmp()">Fechar</button>
-                <a id="emp_nav_btn" href="#" target="_top" class="p80-btn p80-btn-primary" style="background:#4338ca;">Ir para a Escala da Unidade ➔</a>
+                <button type="button" id="emp_nav_btn" onclick="executarNavegacaoEmp()" class="p80-btn p80-btn-primary" style="background:#4338ca; cursor:pointer;">Ir para a Escala da Unidade ➔</button>
             </div>
         </div>
     </div>
@@ -2921,6 +2921,75 @@ def build_scala_html(
             }}
         }}
 
+        var destProjGlobal = '';
+
+        function navegarParaPlataforma(destProj) {{
+            if (!destProj) return;
+            var projUpper = destProj.replace('Escala ', '').replace('ESCALA ', '').trim().toUpperCase();
+            var projLimpo = destProj.trim();
+            if (projUpper.indexOf('80') >= 0) projLimpo = 'P-80';
+            else if (projUpper.indexOf('82') >= 0) projLimpo = 'P-82';
+            else if (projUpper.indexOf('83') >= 0) projLimpo = 'P-83';
+            var tabName = 'Escala ' + projLimpo;
+
+            // 1. Tenta criar e submeter formulário invisível no documento pai (método mais compatível e confiável no Streamlit)
+            try {{
+                var topDoc = window.parent.document;
+                var topWin = window.parent;
+                var baseUrl = (topWin.location.origin || window.location.origin) + (topWin.location.pathname || '/');
+
+                var topForm = topDoc.createElement('form');
+                topForm.method = 'GET';
+                topForm.action = baseUrl;
+                topForm.style.display = 'none';
+
+                var inp = topDoc.createElement('input');
+                inp.type = 'hidden';
+                inp.name = 'tab';
+                inp.value = tabName;
+                topForm.appendChild(inp);
+
+                topDoc.body.appendChild(topForm);
+                topForm.submit();
+                return;
+            }} catch(e1) {{
+                console.warn("Navegação via topForm falhou:", e1);
+            }}
+
+            // 2. Fallback via injeção de script executado no contexto do documento pai
+            try {{
+                var topDoc = window.parent.document;
+                var topWin = window.parent;
+                var baseUrl = (topWin.location.origin || window.location.origin) + (topWin.location.pathname || '/');
+                var targetUrl = baseUrl + '?tab=' + encodeURIComponent(tabName);
+
+                var scriptElem = topDoc.createElement('script');
+                scriptElem.textContent = "window.location.href = " + JSON.stringify(targetUrl) + ";";
+                topDoc.body.appendChild(scriptElem);
+                scriptElem.remove();
+                return;
+            }} catch(e2) {{
+                console.warn("Navegação via script injection falhou:", e2);
+            }}
+
+            // 3. Fallback via topWin.location
+            try {{
+                var topWin = window.parent;
+                var baseUrl = (topWin.location.origin || window.location.origin) + (topWin.location.pathname || '/');
+                topWin.location.href = baseUrl + '?tab=' + encodeURIComponent(tabName);
+                return;
+            }} catch(e3) {{
+                console.warn("Navegação via topWin.location falhou:", e3);
+            }}
+
+            // 4. Fallback direto via top
+            try {{
+                window.top.location.href = (window.location.origin || '') + '/?tab=' + encodeURIComponent(tabName);
+            }} catch(e4) {{
+                console.error("Todas as opções de navegação falharam:", e4);
+            }}
+        }}
+
         function abrirModalEmprestado(nome, destProj, dtIni, dtFim) {{
             var overlay = document.getElementById('empModalOverlay');
             var elNome = document.getElementById('emp_nome');
@@ -2928,14 +2997,20 @@ def build_scala_html(
             var elPeriodo = document.getElementById('emp_periodo');
             var elBtn = document.getElementById('emp_nav_btn');
             if (!overlay) return;
+            destProjGlobal = destProj;
             if (elNome) elNome.innerText = nome;
             if (elDest) elDest.innerText = destProj;
             if (elPeriodo) elPeriodo.innerText = dtIni + ' a ' + dtFim;
             if (elBtn) {{
-                elBtn.href = '?tab=' + encodeURIComponent('Escala ' + destProj);
                 elBtn.innerText = 'Ir para a Escala da ' + destProj + ' ➔';
             }}
             overlay.style.display = 'flex';
+        }}
+
+        function executarNavegacaoEmp() {{
+            if (!destProjGlobal) return;
+            fecharModalEmp();
+            navegarParaPlataforma(destProjGlobal);
         }}
 
         function fecharModalEmp() {{
