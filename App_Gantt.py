@@ -52,6 +52,8 @@ class Config:
         "Férias": "#6B7280",
         "Workshop": "#14B8A6",
         "Visita Técnica": "#EC4899",
+        "Licença": "#9F1239",
+        "Emprestado": "#4338CA",
     }
 
     COLOR_TODAY = "#DC2626"
@@ -275,6 +277,11 @@ class DataLoader:
                 "TREIN": "Treinamento",
                 "TREINAMENTO": "Treinamento",
                 "PMB": "Treinamento",
+                "LIC": "Licença",
+                "LICENÇA": "Licença",
+                "LICENCA": "Licença",
+                "EMP": "Emprestado",
+                "EMPRESTADO": "Emprestado",
             }
 
             rows = []

@@ -97,6 +97,22 @@ STATUS_MAP = {
         "borda": "#b91c1c",
         "desc": "Conflito de agendamento detectado"
     },
+    "LIC": {
+        "nome": "Licença",
+        "codigo": "LIC",
+        "bg": "#9f1239",
+        "color": "#FFFFFF",
+        "borda": "#881337",
+        "desc": "Licença"
+    },
+    "EMP": {
+        "nome": "Emprestado",
+        "codigo": "EMP",
+        "bg": "#4338ca",
+        "color": "#FFFFFF",
+        "borda": "#312e81",
+        "desc": "Emprestado para outra unidade"
+    },
 }
 
 # Aliases para compatibilidade retroativa
@@ -105,6 +121,27 @@ STATUS_MAP["TREINAMENTO"] = STATUS_MAP["TREIN"]
 STATUS_MAP["E"] = STATUS_MAP["EMB"]
 STATUS_MAP["CONFLITO"] = STATUS_MAP["CONF"]
 STATUS_MAP["ESTALEIRO"] = STATUS_MAP["BASE"]
+STATUS_MAP["LICENÇA"] = STATUS_MAP["LIC"]
+STATUS_MAP["LICENCA"] = STATUS_MAP["LIC"]
+STATUS_MAP["EMPRESTADO"] = STATUS_MAP["EMP"]
+
+
+def is_mecanica(d: Optional[str]) -> bool:
+    """Identifica se a disciplina é Mecânica independentemente de encoding ou acentuação."""
+    u = str(d or "").upper()
+    return "MEC" in u
+
+
+def is_instrumentacao(d: Optional[str]) -> bool:
+    """Identifica se a disciplina é Instrumentação independentemente de encoding ou acentuação."""
+    u = str(d or "").upper()
+    return "INST" in u
+
+
+def is_eletrica(d: Optional[str]) -> bool:
+    """Identifica se a disciplina é Elétrica independentemente de encoding ou acentuação."""
+    u = str(d or "").upper()
+    return "ELET" in u or "ELÉT" in u or ("EL" in u and "TRIC" in u)
 
 
 def normalizar_status(st: Optional[str]) -> str:
@@ -126,6 +163,10 @@ def normalizar_status(st: Optional[str]) -> str:
         return "TREIN"
     if s in ("CONF", "CONFLITO"):
         return "CONF"
+    if s in ("LIC", "LICENÇA", "LICENCA"):
+        return "LIC"
+    if s in ("EMP", "EMPRESTADO"):
+        return "EMP"
     return s
 
 
@@ -231,10 +272,111 @@ class EscalaP80DB:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_data ON p80_audit_log(data_hora DESC)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_proj ON p80_audit_log(projeto)")
 
+            # Tabela de Configuração de Vagas Mínimas por Ativo (Mecânica, Instrumentação, Elétrica, Total)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS p80_config_vagas (
+                    projeto TEXT PRIMARY KEY,
+                    min_mecanica INTEGER DEFAULT 0,
+                    min_instrumentacao INTEGER DEFAULT 0,
+                    min_eletrica INTEGER DEFAULT 0,
+                    min_total INTEGER DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Migração: coluna regime_folga em p80_membros ('14x21' ou '14x14')
+            cursor.execute("PRAGMA table_info(p80_membros)")
+            cols_membros = [row["name"] for row in cursor.fetchall()]
+            if "regime_folga" not in cols_membros:
+                cursor.execute("ALTER TABLE p80_membros ADD COLUMN regime_folga TEXT DEFAULT '14x21'")
+
+            # Correção de encoding/acentos nas disciplinas
+            cursor.execute("UPDATE p80_membros SET disciplina = 'Elétrica' WHERE disciplina LIKE '%TRIC%' OR disciplina LIKE '%ELET%'")
+            cursor.execute("UPDATE p80_escalas SET disciplina = 'Elétrica' WHERE disciplina LIKE '%TRIC%' OR disciplina LIKE '%ELET%'")
+            cursor.execute("UPDATE p80_membros SET disciplina = 'Mecânica' WHERE disciplina LIKE '%MEC%'")
+            cursor.execute("UPDATE p80_escalas SET disciplina = 'Mecânica' WHERE disciplina LIKE '%MEC%'")
+            cursor.execute("UPDATE p80_membros SET disciplina = 'Instrumentação' WHERE disciplina LIKE '%INST%'")
+            cursor.execute("UPDATE p80_escalas SET disciplina = 'Instrumentação' WHERE disciplina LIKE '%INST%'")
+
             cursor.execute("UPDATE p80_escalas SET status = 'EMB' WHERE status = 'E'")
             # Regra estrita: Não puxa supervisores/coordenadores para escalas de plataforma
             cursor.execute("UPDATE p80_membros SET ativo = 0 WHERE UPPER(funcao) LIKE '%SUPERVIS%' OR UPPER(funcao) LIKE '%COORD%'")
             conn.commit()
+
+    @classmethod
+    def get_regime_colaborador(cls, nome: str) -> str:
+        """Retorna o regime de folga configurado no cadastro do colaborador ('14x21' ou '14x14')."""
+        with cls.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT regime_folga FROM p80_membros WHERE UPPER(TRIM(nome)) = ?", (nome.strip().upper(),))
+            row = cursor.fetchone()
+            if row and row["regime_folga"]:
+                reg = str(row["regime_folga"]).strip()
+                if "14" in reg and "21" not in reg:
+                    return "14x14"
+        return "14x21"
+
+    @classmethod
+    def set_regime_colaborador(cls, nome: str, regime: str) -> bool:
+        """Atualiza o regime de folga no cadastro do colaborador."""
+        reg_final = "14x14" if ("14" in str(regime) and "21" not in str(regime)) else "14x21"
+        with cls.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE p80_membros SET regime_folga = ? WHERE UPPER(TRIM(nome)) = ?", (reg_final, nome.strip().upper()))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    @classmethod
+    def get_config_vagas(cls, projeto: str) -> Dict[str, int]:
+        """Obtém os parâmetros de vagas mínimas da plataforma."""
+        proj_norm = normalizar_projeto(projeto)
+        with cls.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT min_mecanica, min_instrumentacao, min_eletrica, min_total FROM p80_config_vagas WHERE projeto = ?", (proj_norm,))
+            row = cursor.fetchone()
+            if row:
+                return {
+                    "min_mecanica": int(row["min_mecanica"] or 0),
+                    "min_instrumentacao": int(row["min_instrumentacao"] or 0),
+                    "min_eletrica": int(row["min_eletrica"] or 0),
+                    "min_total": int(row["min_total"] or 0)
+                }
+        return {"min_mecanica": 0, "min_instrumentacao": 0, "min_eletrica": 0, "min_total": 0}
+
+    @classmethod
+    def set_config_vagas(
+        cls,
+        projeto: str,
+        min_mec: int = 0,
+        min_inst: int = 0,
+        min_elet: int = 0,
+        min_total: int = 0,
+        min_mecanica: Optional[int] = None,
+        min_instrumentacao: Optional[int] = None,
+        min_eletrica: Optional[int] = None
+    ) -> bool:
+        if min_mecanica is not None:
+            min_mec = min_mecanica
+        if min_instrumentacao is not None:
+            min_inst = min_instrumentacao
+        if min_eletrica is not None:
+            min_elet = min_eletrica
+        """Salva os parâmetros de vagas mínimas para a plataforma informada."""
+        proj_norm = normalizar_projeto(projeto)
+        with cls.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO p80_config_vagas (projeto, min_mecanica, min_instrumentacao, min_eletrica, min_total, updated_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(projeto) DO UPDATE SET
+                    min_mecanica = excluded.min_mecanica,
+                    min_instrumentacao = excluded.min_instrumentacao,
+                    min_eletrica = excluded.min_eletrica,
+                    min_total = excluded.min_total,
+                    updated_at = CURRENT_TIMESTAMP
+            """, (proj_norm, int(min_mec), int(min_inst), int(min_elet), int(min_total)))
+            conn.commit()
+            return True
 
     @classmethod
     def sync_membros_from_equipe(cls, equipe_df: Optional[pd.DataFrame]) -> int:
@@ -277,8 +419,13 @@ class EscalaP80DB:
                     continue
 
                 cursor.execute("""
-                    INSERT OR IGNORE INTO p80_membros (nome, disciplina, funcao, projeto, ativo)
-                    VALUES (?, ?, ?, ?, 1)
+                    INSERT INTO p80_membros (nome, disciplina, funcao, projeto, ativo, regime_folga)
+                    VALUES (?, ?, ?, ?, 1, '14x21')
+                    ON CONFLICT(nome) DO UPDATE SET
+                        disciplina = excluded.disciplina,
+                        funcao = excluded.funcao,
+                        projeto = excluded.projeto,
+                        ativo = excluded.ativo
                 """, (nome, disciplina, funcao, projeto))
                 if cursor.rowcount > 0:
                     count += 1
@@ -290,7 +437,7 @@ class EscalaP80DB:
         """Retorna todos os membros cadastrados na base (por padrão, exclui supervisores para as escalas)."""
         with cls.get_connection() as conn:
             cursor = conn.cursor()
-            query = "SELECT id, nome, disciplina, funcao, projeto, ativo FROM p80_membros WHERE 1=1"
+            query = "SELECT id, nome, disciplina, funcao, projeto, ativo, COALESCE(regime_folga, '14x21') as regime_folga FROM p80_membros WHERE 1=1"
             if apenas_ativos:
                 query += " AND ativo = 1"
             if excluir_supervisores:
@@ -361,20 +508,49 @@ class EscalaP80DB:
         return membros_combinados, len(membros_nativos), len(membros_externos)
 
     @classmethod
-    def get_escalas_periodo(cls, projeto: str, d_inicio: str, d_fim: str) -> Dict[Tuple[str, str], str]:
-        """Retorna dicionário {(nome, data_iso): status} para o projeto e período informado."""
+    def get_escalas_periodo(
+        cls,
+        projeto: str,
+        d_inicio: str,
+        d_fim: str,
+        incluir_emprestimos: bool = True
+    ) -> Dict[Tuple[str, str], str]:
+        """
+        Retorna dicionário {(nome, data_iso): status} para o projeto e período informado.
+        Se incluir_emprestimos=True, membros nativos desta plataforma que estejam escalados com EMB
+        em outra plataforma offshore aparecem marcados como 'EMP' (Emprestado).
+        """
         proj_norm = normalizar_projeto(projeto)
+        result = {}
         with cls.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT nome, data, status FROM p80_escalas
                 WHERE projeto = ? AND data >= ? AND data <= ?
             """, (proj_norm, d_inicio, d_fim))
-            result = {}
             for row in cursor.fetchall():
-                st_val = "EMB" if row["status"] == "E" else row["status"]
+                st_val = normalizar_status(row["status"])
                 result[(row["nome"], row["data"])] = st_val
-            return result
+
+            if incluir_emprestimos and proj_norm != "TODOS":
+                # Identifica membros nativos deste projeto
+                cursor.execute("""
+                    SELECT nome FROM p80_membros
+                    WHERE ativo = 1 AND projeto = ?
+                """, (proj_norm,))
+                nativos = [row["nome"] for row in cursor.fetchall()]
+                if nativos:
+                    ph = ",".join(["?"] * len(nativos))
+                    cursor.execute(f"""
+                        SELECT nome, projeto, data, status FROM p80_escalas
+                        WHERE projeto != ? AND status IN ('EMB', 'E') AND data >= ? AND data <= ?
+                        AND nome IN ({ph})
+                    """, [proj_norm, d_inicio, d_fim] + nativos)
+                    for row in cursor.fetchall():
+                        # Marca como EMP na plataforma nativa de origem
+                        result[(row["nome"], row["data"])] = "EMP"
+
+        return result
 
     @classmethod
     def get_periodos_agrupados(cls, projeto: str) -> Tuple[List[Dict], Dict[Tuple[str, str], Dict]]:
@@ -405,20 +581,42 @@ class EscalaP80DB:
         por_pessoa = defaultdict(list)
         for r in rows:
             por_pessoa[(r["nome"], r["disciplina"], r["projeto"])].append(
-                (r["data"], normalizar_status(r["status"]), r["observacao"])
+                (r["data"], normalizar_status(r["status"]), r["observacao"], None)
             )
+
+        # Se for um projeto específico, detecta colaboradores nativos emprestados para outros projetos
+        if projeto != "TODOS":
+            proj_norm = normalizar_projeto(projeto)
+            with cls.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT nome, disciplina FROM p80_membros WHERE ativo = 1 AND projeto = ?", (proj_norm,))
+                nativos = {row["nome"]: row["disciplina"] for row in cursor.fetchall()}
+                if nativos:
+                    ph = ",".join(["?"] * len(nativos))
+                    cursor.execute(f"""
+                        SELECT nome, disciplina, projeto, data, status, COALESCE(observacao, '') as observacao
+                        FROM p80_escalas
+                        WHERE projeto != ? AND status IN ('EMB', 'E') AND nome IN ({ph})
+                        ORDER BY nome, data
+                    """, [proj_norm] + list(nativos.keys()))
+                    for r in cursor.fetchall():
+                        disc_nat = nativos.get(r["nome"], r["disciplina"])
+                        obs_emp = f"Emprestado para {r['projeto']}" + (f": {r['observacao']}" if r['observacao'] else "")
+                        por_pessoa[(r["nome"], disc_nat, proj_norm)].append(
+                            (r["data"], "EMP", obs_emp, r["projeto"])
+                        )
 
         lista_periodos = []
         mapa_dia_periodo = {}
 
         for (nome, disc, proj), lista in por_pessoa.items():
             lista.sort(key=lambda x: x[0])
-            p_ini, p_fim, p_st, p_obs, datas_bloco = None, None, None, "", []
-            for dt_str, st_code, obs_str in lista:
+            p_ini, p_fim, p_st, p_obs, datas_bloco, p_dest = None, None, None, "", [], None
+            for dt_str, st_code, obs_str, dest_proj in lista:
                 dt = datetime.strptime(dt_str, "%Y-%m-%d").date()
                 if p_ini is None:
-                    p_ini, p_fim, p_st, p_obs, datas_bloco = dt, dt, st_code, obs_str, [dt_str]
-                elif st_code == p_st and dt == p_fim + timedelta(days=1):
+                    p_ini, p_fim, p_st, p_obs, datas_bloco, p_dest = dt, dt, st_code, obs_str, [dt_str], dest_proj
+                elif st_code == p_st and dt == p_fim + timedelta(days=1) and dest_proj == p_dest:
                     p_fim = dt
                     datas_bloco.append(dt_str)
                     if obs_str and not p_obs:
@@ -428,19 +626,23 @@ class EscalaP80DB:
                         "nome": nome, "disciplina": disc, "projeto": proj,
                         "inicio": p_ini, "fim": p_fim, "status": p_st,
                         "dias": (p_fim - p_ini).days + 1,
-                        "observacao": p_obs
+                        "observacao": p_obs,
+                        "is_emprestado": (p_st == "EMP"),
+                        "projeto_destino": p_dest
                     }
                     lista_periodos.append(p_obj)
                     for d_iso in datas_bloco:
                         mapa_dia_periodo[(nome, d_iso)] = p_obj
-                    p_ini, p_fim, p_st, p_obs, datas_bloco = dt, dt, st_code, obs_str, [dt_str]
+                    p_ini, p_fim, p_st, p_obs, datas_bloco, p_dest = dt, dt, st_code, obs_str, [dt_str], dest_proj
 
             if p_ini is not None:
                 p_obj = {
                     "nome": nome, "disciplina": disc, "projeto": proj,
                     "inicio": p_ini, "fim": p_fim, "status": p_st,
                     "dias": (p_fim - p_ini).days + 1,
-                    "observacao": p_obs
+                    "observacao": p_obs,
+                    "is_emprestado": (p_st == "EMP"),
+                    "projeto_destino": p_dest
                 }
                 lista_periodos.append(p_obj)
                 for d_iso in datas_bloco:
@@ -460,14 +662,17 @@ class EscalaP80DB:
         d_fim: date,
         status: str,
         observacao: str = "",
+        regime_folga: Optional[str] = None,
         skip_log: bool = False
     ) -> Tuple[int, int]:
         """
         Salva escala para cada dia do intervalo [d_inicio, d_fim] no projeto informado.
         Regra obrigatória de negócio:
-        Sempre que for lançado um embarque (status == 'EMB'), gera AUTOMATICAMENTE
-        a projeção de 1,5 dias de folga para cada dia de embarque à frente,
-        arredondado para cima com math.ceil, gravado no mesmo projeto.
+        - Se status == 'EMB':
+          * Se regime_folga == '14x14': gera 1 dia de folga por dia de embarque (1x).
+          * Se regime_folga == '14x21': gera 1,5 dias de folga por dia de embarque (ceil(1,5x)).
+        - Se status == 'LIC':
+          * Não gera projeção de folga (apenas marca o período).
         Retorna (dias_salvos, dias_folga_projetados).
         """
         nome = nome.strip().upper()
@@ -480,6 +685,13 @@ class EscalaP80DB:
         total_dias = (d_fim - d_inicio).days + 1
         dias_salvos = 0
         dias_folga_projetados = 0
+
+        # Se informado regime no lançamento, persiste no cadastro do colaborador
+        if regime_folga:
+            cls.set_regime_colaborador(nome, regime_folga)
+
+        regime_atual = regime_folga or cls.get_regime_colaborador(nome)
+        is_14x14 = ("14" in str(regime_atual) and "21" not in str(regime_atual))
 
         with cls.get_connection() as conn:
             cursor = conn.cursor()
@@ -499,19 +711,25 @@ class EscalaP80DB:
                 dias_salvos += 1
 
             if st_final == "EMB":
-                qtd_folga = math.ceil(total_dias * 1.5)
+                if is_14x14:
+                    qtd_folga = total_dias
+                    obs_folga_auto = "Projeção automática de folga (14x14 - 1x)"
+                else:
+                    qtd_folga = math.ceil(total_dias * 1.5)
+                    obs_folga_auto = "Projeção automática de folga (14x21 - 1,5x)"
+
                 curr_folga = d_fim + timedelta(days=1)
                 for _ in range(qtd_folga):
                     iso_folga = curr_folga.strftime("%Y-%m-%d")
                     cursor.execute("""
                         INSERT INTO p80_escalas (nome, disciplina, projeto, data, status, observacao, updated_at)
-                        VALUES (?, ?, ?, ?, 'FOL', 'Projeção automática de folga (1,5x)', CURRENT_TIMESTAMP)
+                        VALUES (?, ?, ?, ?, 'FOL', ?, CURRENT_TIMESTAMP)
                         ON CONFLICT(nome, projeto, data) DO UPDATE SET
                             disciplina = excluded.disciplina,
                             status = excluded.status,
                             observacao = excluded.observacao,
                             updated_at = CURRENT_TIMESTAMP
-                    """, (nome, disciplina, proj_norm, iso_folga))
+                    """, (nome, disciplina, proj_norm, iso_folga, obs_folga_auto))
                     curr_folga += timedelta(days=1)
                     dias_folga_projetados += 1
 
@@ -520,7 +738,7 @@ class EscalaP80DB:
         if not skip_log:
             cls.registrar_log(
                 acao="INSERÇÃO",
-                detalhes=f"Lançou período de '{st_final}' de {d_inicio:%d/%m/%Y} a {d_fim:%d/%m/%Y} ({total_dias} dias)." + (f" Projeção automática gerada: {dias_folga_projetados} dias de folga (FOL)." if dias_folga_projetados > 0 else "") + (f" Obs: {observacao}" if observacao else ""),
+                detalhes=f"Lançou período de '{st_final}' de {d_inicio:%d/%m/%Y} a {d_fim:%d/%m/%Y} ({total_dias} dias)." + (f" Projeção automática gerada: {dias_folga_projetados} dias de folga (FOL - Regime {regime_atual})." if dias_folga_projetados > 0 else "") + (f" Obs: {observacao}" if observacao else ""),
                 projeto=proj_norm,
                 colaborador=nome
             )
@@ -528,20 +746,20 @@ class EscalaP80DB:
         return dias_salvos, dias_folga_projetados
 
     @classmethod
-    def salvar_escala_ciclica_14x21(
+    def salvar_escala_ciclica(
         cls,
         nome: str,
         disciplina: str,
         projeto: str,
         d_inicio: date,
         qtd_ciclos: int = 7,
-        observacao: str = ""
+        observacao: str = "",
+        regime: str = "14x21"
     ) -> Tuple[int, int]:
         """
-        Gera QTD_CICLOS consecutivos no regime offshore 14x21 a partir de d_inicio:
-        - Cada ciclo contém 14 dias de embarque (EMB) seguidos por 21 dias de folga (FOL).
-        - Total por ciclo: 35 dias (14 + 21).
-        - Exemplo: 7 embarques completos criam 7 períodos de 14 dias de EMB e 7 períodos de 21 dias de FOL consecutivos.
+        Gera QTD_CICLOS consecutivos no regime offshore (14x21 ou 14x14) a partir de d_inicio:
+        - 14x21: Cada ciclo contém 14 dias de embarque (EMB) e 21 dias de folga (FOL) - total 35 dias.
+        - 14x14: Cada ciclo contém 14 dias de embarque (EMB) e 14 dias de folga (FOL) - total 28 dias.
         Retorna (total_dias_emb, total_dias_fol).
         """
         proj_norm = normalizar_projeto(projeto)
@@ -551,6 +769,14 @@ class EscalaP80DB:
         if qtd_ciclos > 36:
             qtd_ciclos = 36
 
+        is_14x14 = ("14" in str(regime) and "21" not in str(regime))
+        reg_final = "14x14" if is_14x14 else "14x21"
+        cls.set_regime_colaborador(nome, reg_final)
+
+        dias_emb_c = 14
+        dias_fol_c = 14 if is_14x14 else 21
+        dias_ciclo = dias_emb_c + dias_fol_c
+
         total_emb = 0
         total_fol = 0
 
@@ -558,14 +784,14 @@ class EscalaP80DB:
             cursor = conn.cursor()
             for c_idx in range(qtd_ciclos):
                 c_num = c_idx + 1
-                c_offset_days = c_idx * 35
+                c_offset_days = c_idx * dias_ciclo
                 emb_ini = d_inicio + timedelta(days=c_offset_days)
-                emb_fim = emb_ini + timedelta(days=13)  # 14 dias de embarque
+                emb_fim = emb_ini + timedelta(days=dias_emb_c - 1)  # 14 dias
                 fol_ini = emb_fim + timedelta(days=1)
-                fol_fim = fol_ini + timedelta(days=20)  # 21 dias de folga
+                fol_fim = fol_ini + timedelta(days=dias_fol_c - 1)  # 14 ou 21 dias
 
-                obs_emb = observacao if observacao else f"Escala 14x21 (Ciclo {c_num}/{qtd_ciclos})"
-                obs_fol = f"Folga 14x21 (Ciclo {c_num}/{qtd_ciclos} - 21 dias)"
+                obs_emb = observacao if observacao else f"Escala {reg_final} (Ciclo {c_num}/{qtd_ciclos})"
+                obs_fol = f"Folga {reg_final} (Ciclo {c_num}/{qtd_ciclos} - {dias_fol_c} dias)"
 
                 # 1. 14 dias de embarque (EMB)
                 curr = emb_ini
@@ -583,7 +809,7 @@ class EscalaP80DB:
                     curr += timedelta(days=1)
                     total_emb += 1
 
-                # 2. 21 dias de folga (FOL)
+                # 2. Folga (FOL)
                 curr = fol_ini
                 while curr <= fol_fim:
                     iso_dt = curr.strftime("%Y-%m-%d")
@@ -603,12 +829,24 @@ class EscalaP80DB:
 
         cls.registrar_log(
             acao="INSERÇÃO",
-            detalhes=f"Alocou escala contínua 14x21 ({qtd_ciclos} ciclos) a partir de {d_inicio:%d/%m/%Y} (Total: {total_emb} dias EMB e {total_fol} dias FOL)." + (f" Obs: {observacao}" if observacao else ""),
+            detalhes=f"Alocou escala contínua {reg_final} ({qtd_ciclos} ciclos) a partir de {d_inicio:%d/%m/%Y} (Total: {total_emb} dias EMB e {total_fol} dias FOL)." + (f" Obs: {observacao}" if observacao else ""),
             projeto=proj_norm,
             colaborador=nome
         )
-
         return total_emb, total_fol
+
+    @classmethod
+    def salvar_escala_ciclica_14x21(
+        cls,
+        nome: str,
+        disciplina: str,
+        projeto: str,
+        d_inicio: date,
+        qtd_ciclos: int = 7,
+        observacao: str = "",
+        regime: str = "14x21"
+    ) -> Tuple[int, int]:
+        return cls.salvar_escala_ciclica(nome, disciplina, projeto, d_inicio, qtd_ciclos, observacao, regime)
 
     @classmethod
     def atualizar_periodo(
@@ -621,16 +859,16 @@ class EscalaP80DB:
         d_ini_novo: date,
         d_fim_novo: date,
         status_novo: str,
-        observacao: str = ""
+        observacao: str = "",
+        regime_folga: Optional[str] = None
     ) -> Tuple[int, int]:
         """
         Atualiza um período:
         Se o período antigo ou novo for EMB (Embarque):
         - Limpa o período antigo de embarque.
         - Limpa as folgas antigas subsequentes associadas ao embarque anterior.
-        - Se a nova data de término for encurtada (ex: de 10 dias para 6 dias), limpa qualquer
-          folga remanescente do intervalo antigo para que reflita rigorosamente os novos dias (ex: 9 dias de folga).
-        - Grava o novo período com recálculo automático de math.ceil(dias * 1.5) dias de folga a partir de d_fim_novo + 1.
+        - Se a nova data de término for encurtada, limpa qualquer folga remanescente.
+        - Grava o novo período com recálculo automático de folga a partir de d_fim_novo + 1 (respeitando 14x21 ou 14x14).
         """
         proj_norm = normalizar_projeto(projeto)
         nome = nome.strip().upper()
@@ -658,17 +896,15 @@ class EscalaP80DB:
             # 3. Se o período antigo continha EMB, remove folgas subsequentes associadas
             if tinha_emb_antigo:
                 total_dias_ant = (d_fim_antigo - d_ini_antigo).days + 1
-                qtd_folga_ant = math.ceil(total_dias_ant * 1.5)
+                qtd_folga_ant = math.ceil(total_dias_ant * 1.5) + 2
                 f_ini_ant = (d_fim_antigo + timedelta(days=1)).strftime("%Y-%m-%d")
-                f_fim_ant = (d_fim_antigo + timedelta(days=qtd_folga_ant + 2)).strftime("%Y-%m-%d")
+                f_fim_ant = (d_fim_antigo + timedelta(days=qtd_folga_ant)).strftime("%Y-%m-%d")
 
                 cursor.execute("""
                     DELETE FROM p80_escalas
                     WHERE UPPER(TRIM(nome)) = ? AND UPPER(TRIM(projeto)) = ? AND data >= ? AND data <= ? AND status = 'FOL'
                 """, (nome, proj_norm, f_ini_ant, f_fim_ant))
 
-                # Se a nova data de término for anterior à antiga (ex: encurtou de 10 para 6 dias):
-                # Limpa qualquer folga que tenha ficado no intervalo entre d_fim_novo e a folga antiga
                 if d_fim_novo < d_fim_antigo:
                     f_inter_ini = (d_fim_novo + timedelta(days=1)).strftime("%Y-%m-%d")
                     cursor.execute("""
@@ -678,7 +914,7 @@ class EscalaP80DB:
 
             conn.commit()
 
-        # 4. Salva o novo período (se for EMB, projeta automaticamente ceil(dias * 1.5) a partir de d_fim_novo + 1)
+        # 4. Salva o novo período com projeção de folga apropriada
         res = cls.salvar_escala_periodo(
             nome=nome,
             disciplina=disciplina,
@@ -687,6 +923,7 @@ class EscalaP80DB:
             d_fim=d_fim_novo,
             status=st_novo_norm,
             observacao=observacao,
+            regime_folga=regime_folga,
             skip_log=True
         )
 
@@ -1114,10 +1351,12 @@ def integrar_escalas_com_cronograma(
     cronograma_df: Optional[pd.DataFrame],
     proj_norm: str,
     ano: int,
-    mes: int
+    mes: int,
+    dt_inicio_custom: Optional[date] = None,
+    dt_fim_custom: Optional[date] = None
 ) -> Tuple[Dict[Tuple[str, str], str], Dict[Tuple[str, str], Dict], List[Dict], List[Dict], int]:
     """
-    Integra os eventos do cronograma externo à grade mensal da plataforma:
+    Integra os eventos do cronograma externo à grade mensal ou contínua da plataforma:
     - Tipos importados:
       * 'Estaleiro' -> Mapeado para status 'BASE' com observação 'Estaleiro (Cronograma)'
       * 'Férias' / 'Ferias' -> Mapeado para status 'FÉR' com observação 'Férias (Cronograma)'
@@ -1139,9 +1378,13 @@ def integrar_escalas_com_cronograma(
         qtd_ext = sum(1 for m in membros_atualizados if m.get("is_externo"))
         return merged_map, merged_periodos, lista_conflitos, membros_atualizados, qtd_ext
 
-    _, dias_no_mes = calendar.monthrange(ano, mes)
-    dt_ini_mes = date(ano, mes, 1)
-    dt_fim_mes = date(ano, mes, dias_no_mes)
+    if dt_inicio_custom is not None and dt_fim_custom is not None:
+        dt_ini_mes = dt_inicio_custom
+        dt_fim_mes = dt_fim_custom
+    else:
+        _, dias_no_mes = calendar.monthrange(ano, mes)
+        dt_ini_mes = date(ano, mes, 1)
+        dt_fim_mes = date(ano, mes, dias_no_mes)
 
     # Filtra eventos que não sejam da própria escala da plataforma no SQLite
     df_crono = cronograma_df.copy()
@@ -1283,7 +1526,7 @@ def integrar_escalas_com_cronograma(
     return merged_map, merged_periodos, lista_conflitos, membros_atualizados, qtd_ext
 
 
-# --- GERADOR DE HTML DA GRADE MENSAL COM SUPORTE A CLIQUE NO PERÍODO --------
+# --- GERADOR DE HTML DA GRADE DE ESCALA (JANELA CONTÍNUA 6 MESES / RESUMO VAGAS / STATUS LIC & EMP) ---
 def build_scala_html(
     projeto: str,
     ano: int,
@@ -1294,16 +1537,48 @@ def build_scala_html(
     qtd_nativos: int,
     qtd_externos: int,
     is_editor: bool,
-    filtro_busca: str = ""
+    filtro_busca: str = "",
+    meses_info: Optional[List[Dict]] = None,
+    lista_dias: Optional[List[date]] = None,
+    config_vagas: Optional[Dict[str, int]] = None
 ) -> str:
     """
-    Gera o HTML compacto da escala:
-    - Colunas dos dias com 38px
-    - Células sem texto detalhado
-    - Quando em modo edição (is_editor=True), cada badge é clicável para edição do período via URL query params!
+    Gera o HTML compacto e fluido da escala:
+    - Janela contínua de 6 meses com rolagem horizontal contínua
+    - Cabeçalho duplo fixo (Sticky): Linha 1 = Mês/Ano; Linha 2 = Dias do mês com indicador do dia da semana
+    - Coluna de nomes e disciplinas fixa à esquerda (Sticky)
+    - Delimitação visual nítida no último dia de cada mês
+    - Suporte aos novos status: LIC (Licença, #9f1239) e EMP (Emprestado, #4338ca)
+    - Seleção de Regime de Folga (14x21 vs 14x14)
+    - Resumo diário de efetivo a bordo com formatação condicional de alerta para vagas mínimas (Mecânica, Instrumentação, Elétrica e Total)
+    - Eletricistas identificados em Amarelo (#eab308) na divisão de turma a bordo
+    - Modais interativos para edição, exclusão, auto-permuta e pop-up informativo de colaborador emprestado (EMP)
     """
-    _, num_dias = calendar.monthrange(ano, mes)
     hoje_iso = date.today().strftime("%Y-%m-%d")
+
+    if not lista_dias:
+        _, num_dias = calendar.monthrange(ano, mes)
+        lista_dias = [date(ano, mes, d) for d in range(1, num_dias + 1)]
+        meses_info = [{
+            "ano": ano,
+            "mes": mes,
+            "nome": MESES_PT[mes - 1],
+            "dias": num_dias
+        }]
+    elif not meses_info:
+        meses_dict = {}
+        for d in lista_dias:
+            k = (d.year, d.month)
+            if k not in meses_dict:
+                meses_dict[k] = {"ano": d.year, "mes": d.month, "nome": MESES_PT[d.month - 1], "dias": 0}
+            meses_dict[k]["dias"] += 1
+        meses_info = list(meses_dict.values())
+
+    config_vagas = config_vagas or {"min_mecanica": 0, "min_instrumentacao": 0, "min_eletrica": 0, "min_total": 0}
+    min_mec = int(config_vagas.get("min_mecanica", 0) or 0)
+    min_inst = int(config_vagas.get("min_instrumentacao", 0) or 0)
+    min_elet = int(config_vagas.get("min_eletrica", 0) or 0)
+    min_tot = int(config_vagas.get("min_total", 0) or 0)
 
     filtro = filtro_busca.strip().upper()
     if filtro:
@@ -1317,13 +1592,21 @@ def build_scala_html(
     grupos: Dict[str, List[Dict]] = {d: [] for d in DISCIPLINAS_PADRAO}
     for m in membros_filtrados:
         disc = m["disciplina"]
-        if disc not in grupos:
-            grupos[disc] = []
-        grupos[disc].append(m)
+        if is_mecanica(disc):
+            grupos["Mecânica"].append(m)
+        elif is_instrumentacao(disc):
+            grupos["Instrumentação"].append(m)
+        elif is_eletrica(disc):
+            grupos["Elétrica"].append(m)
+        else:
+            if disc not in grupos:
+                grupos[disc] = []
+            grupos[disc].append(m)
 
-    col_width_dia = 38
-    col_width_nome = 210
-    total_grid_min_width = col_width_nome + (num_dias * col_width_dia)
+    total_dias = len(lista_dias)
+    col_width_dia = 28
+    col_width_nome = 200
+    total_grid_min_width = col_width_nome + (total_dias * col_width_dia)
 
     css = f"""
     <style>
@@ -1338,8 +1621,8 @@ def build_scala_html(
         .header-bar {{
             background: #075b9b;
             color: #ffffff;
-            padding: 12px 16px;
-            font-size: 16px;
+            padding: 10px 14px;
+            font-size: 15px;
             font-weight: bold;
             border-radius: 6px 6px 0 0;
             display: flex;
@@ -1351,7 +1634,7 @@ def build_scala_html(
             flex-wrap: wrap;
             gap: 10px;
             align-items: center;
-            padding: 8px 14px;
+            padding: 6px 12px;
             background: #ffffff;
             border-bottom: 1px solid #d7e0e6;
             font-size: 11px;
@@ -1372,15 +1655,15 @@ def build_scala_html(
             background: #ffffff;
             border: 1px solid #d7e0e6;
             border-radius: 0 0 6px 6px;
-            max-height: 720px;
+            max-height: 740px;
         }}
         .grid {{
             display: grid;
-            grid-template-columns: {col_width_nome}px repeat({num_dias}, minmax({col_width_dia}px, 1fr));
+            grid-template-columns: {col_width_nome}px repeat({total_dias}, {col_width_dia}px);
             min-width: {total_grid_min_width}px;
         }}
         .cell {{
-            min-height: 38px;
+            min-height: 34px;
             padding: 2px 1px;
             border-right: 1px solid #dfe6eb;
             border-bottom: 1px solid #dfe6eb;
@@ -1396,15 +1679,13 @@ def build_scala_html(
             font-weight: bold;
             text-align: center;
             position: sticky;
-            top: 0;
-            z-index: 2;
-            padding: 4px 1px;
+            padding: 2px 1px;
         }}
         .label {{
             position: sticky;
             left: 0;
             background: #ffffff;
-            z-index: 1;
+            z-index: 2;
             font-weight: bold;
             justify-content: center;
             align-items: flex-start;
@@ -1415,7 +1696,6 @@ def build_scala_html(
             text-overflow: ellipsis;
         }}
         .head.label {{
-            z-index: 3;
             background: #eaf2f8;
             align-items: center;
             justify-content: center;
@@ -1429,18 +1709,21 @@ def build_scala_html(
             border-left: 2px solid #dc2626 !important;
             border-right: 2px solid #dc2626 !important;
         }}
+        .border-month-end {{
+            border-right: 2px solid #0284c7 !important;
+        }}
         .discipline-header {{
             grid-column: 1 / -1;
             background: #075b9b;
             color: #ffffff;
             font-weight: bold;
-            padding: 8px 12px;
+            padding: 6px 12px;
             font-size: 12px;
             text-transform: uppercase;
             letter-spacing: 0.5px;
             position: sticky;
             left: 0;
-            z-index: 1;
+            z-index: 2;
         }}
         .item-compact {{
             border-radius: 3px;
@@ -1463,7 +1746,7 @@ def build_scala_html(
             transition: transform 0.1s, box-shadow 0.1s;
         }}
         .item-clickable:hover {{
-            transform: scale(1.12);
+            transform: scale(1.15);
             box-shadow: 0 2px 5px rgba(0,0,0,0.3);
             outline: 2px solid #ffffff;
             z-index: 5;
@@ -1479,6 +1762,18 @@ def build_scala_html(
         .item-conf:hover {{
             background: #b91c1c !important;
             outline: 2px solid #fecaca !important;
+            transform: scale(1.18);
+            z-index: 10;
+        }}
+        .item-emp {{
+            background: #4338ca !important;
+            color: #ffffff !important;
+            border: 1px solid #312e81 !important;
+            cursor: pointer;
+        }}
+        .item-emp:hover {{
+            background: #3730a3 !important;
+            outline: 2px solid #c7d2fe !important;
             transform: scale(1.18);
             z-index: 10;
         }}
@@ -1516,14 +1811,66 @@ def build_scala_html(
         .hint-edicao {{
             background: #fef9c3;
             border-bottom: 1px solid #fde047;
-            padding: 7px 14px;
+            padding: 6px 14px;
             font-size: 11px;
             color: #854d0e;
             display: flex;
             align-items: center;
             gap: 6px;
         }}
-        /* Modal Pop-up Styles */
+        .turma-header {{
+            background: #0f172a !important;
+            color: #f8fafc !important;
+            font-size: 12px !important;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-top: 3px solid #0284c7;
+            margin-top: 10px;
+        }}
+        .turma-legenda-mini {{
+            display: flex;
+            gap: 6px;
+            font-size: 10px;
+            font-weight: normal;
+        }}
+        .turma-chip-legenda {{
+            padding: 2px 7px;
+            border-radius: 4px;
+            color: #ffffff;
+            font-weight: 600;
+        }}
+        .turma-balao {{
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 2px 1px;
+            padding: 0 6px;
+            border-radius: 12px;
+            font-size: 10px;
+            font-weight: 700;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+            z-index: 1;
+            min-height: 26px;
+            box-sizing: border-box;
+            border-bottom: 1px solid #dfe6eb;
+            transition: filter 0.15s ease, transform 0.15s ease;
+        }}
+        .turma-balao:hover {{
+            filter: brightness(1.08);
+            transform: translateY(-1px);
+        }}
+        .vagas-alerta {{
+            background: #fee2e2 !important;
+            color: #b91c1c !important;
+            border: 1px solid #fca5a5 !important;
+            font-weight: 800 !important;
+            font-size: 11.5px !important;
+        }}
+        /* Modal Styles */
         .p80-modal-overlay {{
             position: fixed;
             top: 0;
@@ -1542,7 +1889,7 @@ def build_scala_html(
             background: #ffffff;
             border-radius: 12px;
             width: 90%;
-            max-width: 480px;
+            max-width: 490px;
             box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.4);
             overflow: hidden;
             display: flex;
@@ -1656,6 +2003,7 @@ def build_scala_html(
             display: inline-flex;
             align-items: center;
             gap: 5px;
+            text-decoration: none;
         }}
         .p80-btn-primary {{
             background: #075b9b;
@@ -1680,57 +2028,12 @@ def build_scala_html(
         .p80-btn-cancel:hover {{
             background: #cbd5e1;
         }}
-        .turma-header {{
-            background: #0f172a !important;
-            color: #f8fafc !important;
-            font-size: 12px !important;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            border-top: 3px solid #0284c7;
-            margin-top: 10px;
-        }}
-        .turma-legenda-mini {{
-            display: flex;
-            gap: 6px;
-            font-size: 10px;
-            font-weight: normal;
-        }}
-        .turma-chip-legenda {{
-            padding: 2px 7px;
-            border-radius: 4px;
-            color: #ffffff;
-            font-weight: 600;
-        }}
-        .turma-balao {{
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            margin: 3px 2px;
-            padding: 0 8px;
-            border-radius: 14px;
-            font-size: 11px;
-            font-weight: 700;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.15);
-            z-index: 1;
-            min-height: 28px;
-            box-sizing: border-box;
-            border-bottom: 1px solid #dfe6eb;
-            transition: filter 0.15s ease, transform 0.15s ease;
-        }}
-        .turma-balao:hover {{
-            filter: brightness(1.08);
-            transform: translateY(-1px);
-        }}
     </style>
     """
 
     legenda_html = '<div class="legenda-bar"><strong>Legenda:</strong>'
     for k, v in STATUS_MAP.items():
-        if k in ("FÉRIAS", "TREINAMENTO", "E", "CONFLITO", "ESTALEIRO"):
+        if k in ("FÉRIAS", "TREINAMENTO", "E", "CONFLITO", "ESTALEIRO", "LICENÇA", "LICENCA", "EMPRESTADO"):
             continue
         legenda_texto = v['codigo'] if v['codigo'] == v['nome'] else f"{v['codigo']} ({v['nome']})"
         legenda_html += f"""
@@ -1743,23 +2046,42 @@ def build_scala_html(
 
     hint_html = ""
     if is_editor:
-        hint_html = '<div class="hint-edicao">💡 <strong>Modo Edição Ativo:</strong> Clique em qualquer período colorido para editar ou excluir datas/condição, ou clique em um dia livre (—) para lançar escala.</div>'
+        hint_html = '<div class="hint-edicao">💡 <strong>Modo Edição Ativo:</strong> Clique em qualquer período colorido para editar datas, regime ou condição, ou clique em um dia livre (—) para lançar escala.</div>'
 
     grid_cells = []
-    grid_cells.append('<div class="cell head label">PROFISSIONAL / EQUIPE</div>')
 
-    for dia in range(1, num_dias + 1):
-        dt = date(ano, mes, dia)
+    # Linha 1: Mês / Ano (Banner superior agrupando os dias de cada mês)
+    grid_cells.append(
+        '<div class="cell head label" style="grid-column: 1 / 2; top: 0; z-index: 6; background: #0369a1; color: #ffffff; font-size: 11px; text-transform: uppercase; border-bottom: 1px solid #0284c7; height: 30px; min-height: 30px;">MÊS / ANO</div>'
+    )
+    for m_inf in meses_info:
+        m_span = m_inf["dias"]
+        grid_cells.append(
+            f'<div class="cell head" style="grid-column: span {m_span}; top: 0; z-index: 5; background: #075b9b; color: #ffffff; font-weight: bold; font-size: 11.5px; letter-spacing: 0.5px; border-right: 2px solid #0284c7; border-bottom: 1px solid #0284c7; height: 30px; min-height: 30px; display: flex; align-items: center; justify-content: center;">'
+            f'📅 {m_inf["nome"].upper()} {m_inf["ano"]}'
+            f'</div>'
+        )
+
+    # Linha 2: Dias do Mês e Dias da Semana
+    grid_cells.append(
+        '<div class="cell head label" style="top: 30px; z-index: 5; height: 36px; min-height: 36px;">PROFISSIONAL / EQUIPE</div>'
+    )
+    for idx_dia, dt in enumerate(lista_dias):
         sem_idx = dt.weekday()
         sem_str = DIAS_SEMANA_PT[sem_idx]
         is_wk = sem_idx in [5, 6]
         wk_cls = " weekend" if is_wk else ""
         today_cls = " today" if dt.strftime("%Y-%m-%d") == hoje_iso else ""
+        is_month_end = (idx_dia == total_dias - 1) or (lista_dias[idx_dia + 1].month != dt.month)
+        month_end_cls = " border-month-end" if is_month_end else ""
 
         grid_cells.append(
-            f'<div class="cell head{wk_cls}{today_cls}">{dia:02d}<br><small style="font-size:8px;color:#64748b;">{sem_str}</small></div>'
+            f'<div class="cell head{wk_cls}{today_cls}{month_end_cls}" style="top: 30px; z-index: 4; height: 36px; min-height: 36px;">'
+            f'{dt.day:02d}<br><small style="font-size:8px;color:#64748b;">{sem_str}</small>'
+            f'</div>'
         )
 
+    # Linhas dos Colaboradores
     total_linhas = 0
     for disc, lista_membros in grupos.items():
         if not lista_membros:
@@ -1773,21 +2095,24 @@ def build_scala_html(
             total_linhas += 1
             nome = m["nome"]
             is_ext = m.get("is_externo", False)
+            reg_colab = m.get("regime_folga", "14x21")
+            reg_badge = f'<span style="font-size:8.5px;background:#e0f2fe;color:#0369a1;padding:1px 4px;border-radius:3px;margin-left:4px;font-weight:600;">{reg_colab}</span>'
             badge_origem = f'<span class="badge-externo">Externo ({m.get("projeto", "Outro")})</span>' if is_ext else ""
 
             grid_cells.append(
-                f'<div class="cell label"><span>{nome}</span><small style="color:#64748b;font-weight:normal;font-size:9px;">{disc}</small>{badge_origem}</div>'
+                f'<div class="cell label"><span>{nome}</span><small style="color:#64748b;font-weight:normal;font-size:9px;">{disc}{reg_badge}</small>{badge_origem}</div>'
             )
 
-            nome_js = nome.replace("'", "\\'")
-            disc_js = disc.replace("'", "\\'")
+            nome_js = nome.replace("'", "\'")
+            disc_js = disc.replace("'", "\'")
 
-            for dia in range(1, num_dias + 1):
-                iso_dt = f"{ano:04d}-{mes:02d}-{dia:02d}"
-                dt = date(ano, mes, dia)
+            for idx_dia, dt in enumerate(lista_dias):
+                iso_dt = dt.strftime("%Y-%m-%d")
                 is_wk = dt.weekday() in [5, 6]
                 wk_cls = " weekend" if is_wk else ""
                 today_cls = " today" if iso_dt == hoje_iso else ""
+                is_month_end = (idx_dia == total_dias - 1) or (lista_dias[idx_dia + 1].month != dt.month)
+                month_end_cls = " border-month-end" if is_month_end else ""
 
                 status_raw = escalas_map.get((nome, iso_dt))
                 status = normalizar_status(status_raw) if status_raw else None
@@ -1795,63 +2120,77 @@ def build_scala_html(
                 if status and status in STATUS_MAP:
                     st_info = STATUS_MAP[status]
                     periodo_obj = mapa_dia_periodo.get((nome, iso_dt))
-
-                    # Tratamento especial de Conflito (CONF)
-                    is_conf = (status == "CONF")
                     obs_val = (periodo_obj.get("observacao") if periodo_obj else "") or ""
 
-                    if is_conf:
-                        if obs_val:
-                            tooltip = f"⚠️ CONFLITO em {dia:02d}/{mes:02d}: {obs_val}"
-                        else:
-                            tooltip = f"⚠️ CONFLITO em {dia:02d}/{mes:02d}: Divergência entre Escala {projeto} e Cronograma"
-                        if is_editor and periodo_obj:
-                            p_st_real = periodo_obj.get("status_escala") or periodo_obj.get("status") or "EMB"
-                            tooltip += f" | Escala: {periodo_obj['inicio']:%d/%m} a {periodo_obj['fim']:%d/%m} ({p_st_real}) (Clique para editar/excluir)"
-                        item_extra_cls = " item-conf"
-                    else:
-                        item_extra_cls = ""
-                        if is_editor and periodo_obj:
-                            p_st = periodo_obj["status"]
-                            tooltip = f"Clique para abrir pop-up de edição: {nome} | {periodo_obj['inicio']:%d/%m} a {periodo_obj['fim']:%d/%m} ({p_st})"
-                            if obs_val:
-                                tooltip += f" — {obs_val}"
-                        else:
-                            tooltip = f"{nome} em {dia:02d}/{mes:02d}: {st_info['nome']}"
-                            if obs_val:
-                                tooltip += f" ({obs_val})"
-
-                    tooltip_esc = tooltip.replace('"', '&quot;')
-
-                    if is_editor and periodo_obj:
-                        p_ini_str = periodo_obj["inicio"].strftime("%Y-%m-%d")
-                        p_fim_str = periodo_obj["fim"].strftime("%Y-%m-%d")
-                        p_st = periodo_obj.get("status_escala") or periodo_obj.get("status") or status
-                        if p_st == "CONF":
-                            p_st = "EMB"
-                        obs_js = obs_val.replace("'", "\\'")
-
+                    if status == "EMP":
+                        dest_proj = (periodo_obj.get("projeto_destino") if periodo_obj else None) or "Outra Unidade"
+                        p_ini_f = periodo_obj["inicio"].strftime("%d/%m/%Y") if periodo_obj else dt.strftime("%d/%m/%Y")
+                        p_fim_f = periodo_obj["fim"].strftime("%d/%m/%Y") if periodo_obj else dt.strftime("%d/%m/%Y")
+                        tooltip = f"Emprestado para {dest_proj} ({p_ini_f} a {p_fim_f}) — Clique para ver detalhes"
+                        tooltip_esc = tooltip.replace('"', '&quot;')
                         cell_content = f"""
-                        <div class="item-compact item-clickable{item_extra_cls}"
-                             onclick="abrirModalEdicao('{nome_js}', '{disc_js}', '{projeto}', '{p_ini_str}', '{p_fim_str}', '{p_st}', '{obs_js}', false)"
+                        <div class="item-compact item-clickable item-emp"
+                             onclick="abrirModalEmprestado('{nome_js}', '{dest_proj}', '{p_ini_f}', '{p_fim_f}')"
                              style="background:{st_info['bg']};color:{st_info['color']};"
                              title="{tooltip_esc}">
                             {st_info['codigo']}
                         </div>
                         """
+                    elif status == "CONF":
+                        desc_conf = obs_val if obs_val else f"Divergência entre Escala {projeto} e Cronograma"
+                        tooltip = f"⚠️ CONFLITO em {dt.day:02d}/{dt.month:02d}: {desc_conf}"
+                        if is_editor and periodo_obj:
+                            p_st_real = periodo_obj.get("status_escala") or periodo_obj.get("status") or "EMB"
+                            tooltip += f" | Escala: {periodo_obj['inicio']:%d/%m} a {periodo_obj['fim']:%d/%m} ({p_st_real}) (Clique para editar/excluir)"
+                            p_ini_str = periodo_obj["inicio"].strftime("%Y-%m-%d")
+                            p_fim_str = periodo_obj["fim"].strftime("%Y-%m-%d")
+                            obs_js = obs_val.replace("'", "\'")
+                            tooltip_esc = tooltip.replace('"', '&quot;')
+                            cell_content = f"""
+                            <div class="item-compact item-clickable item-conf"
+                                 onclick="abrirModalEdicao('{nome_js}', '{disc_js}', '{projeto}', '{p_ini_str}', '{p_fim_str}', '{p_st_real}', '{obs_js}', false, '{reg_colab}')"
+                                 title="{tooltip_esc}">
+                                CONF
+                            </div>
+                            """
+                        else:
+                            tooltip_esc = tooltip.replace('"', '&quot;')
+                            cell_content = f'<div class="item-compact item-conf" title="{tooltip_esc}">CONF</div>'
                     else:
-                        cell_content = f"""
-                        <div class="item-compact{item_extra_cls}" style="background:{st_info['bg']};color:{st_info['color']};" title="{tooltip_esc}">
-                            {st_info['codigo']}
-                        </div>
-                        """
+                        if is_editor and periodo_obj:
+                            p_st = periodo_obj.get("status_escala") or periodo_obj.get("status") or status
+                            p_ini_str = periodo_obj["inicio"].strftime("%Y-%m-%d")
+                            p_fim_str = periodo_obj["fim"].strftime("%Y-%m-%d")
+                            tooltip = f"Clique para editar: {nome} | {periodo_obj['inicio']:%d/%m} a {periodo_obj['fim']:%d/%m} ({p_st})"
+                            if obs_val:
+                                tooltip += f" — {obs_val}"
+                            tooltip_esc = tooltip.replace('"', '&quot;')
+                            obs_js = obs_val.replace("'", "\'")
+                            cell_content = f"""
+                            <div class="item-compact item-clickable"
+                                 onclick="abrirModalEdicao('{nome_js}', '{disc_js}', '{projeto}', '{p_ini_str}', '{p_fim_str}', '{p_st}', '{obs_js}', false, '{reg_colab}')"
+                                 style="background:{st_info['bg']};color:{st_info['color']};"
+                                 title="{tooltip_esc}">
+                                {st_info['codigo']}
+                            </div>
+                            """
+                        else:
+                            tooltip = f"{nome} em {dt.day:02d}/{dt.month:02d}: {st_info['nome']}"
+                            if obs_val:
+                                tooltip += f" ({obs_val})"
+                            tooltip_esc = tooltip.replace('"', '&quot;')
+                            cell_content = f"""
+                            <div class="item-compact" style="background:{st_info['bg']};color:{st_info['color']};" title="{tooltip_esc}">
+                                {st_info['codigo']}
+                            </div>
+                            """
                 else:
                     if is_editor:
-                        dt_fim_sugest = min(dt + timedelta(days=13), date(ano, mes, num_dias)).strftime("%Y-%m-%d")
-                        tooltip_vazio = f"Clique para lançar escala para {nome} a partir de {dia:02d}/{mes:02d}"
+                        dt_fim_sugest = (dt + timedelta(days=13)).strftime("%Y-%m-%d")
+                        tooltip_vazio = f"Clique para lançar escala para {nome} a partir de {dt.day:02d}/{dt.month:02d}"
                         cell_content = f"""
                         <div class="empty-clickable"
-                             onclick="abrirModalEdicao('{nome_js}', '{disc_js}', '{projeto}', '{iso_dt}', '{dt_fim_sugest}', 'EMB', '', true)"
+                             onclick="abrirModalEdicao('{nome_js}', '{disc_js}', '{projeto}', '{iso_dt}', '{dt_fim_sugest}', 'EMB', '', true, '{reg_colab}')"
                              title="{tooltip_vazio}">
                             —
                         </div>
@@ -1859,12 +2198,13 @@ def build_scala_html(
                     else:
                         cell_content = '<span class="empty-dash">—</span>'
 
-                grid_cells.append(f'<div class="cell{wk_cls}{today_cls}">{cell_content}</div>')
+                grid_cells.append(f'<div class="cell{wk_cls}{today_cls}{month_end_cls}">{cell_content}</div>')
 
     # --- DIVISÃO DE TURMA A BORDO (AO FINAL DE TODAS AS DISCIPLINAS) ---
-    # Helper para identificar se no dia o colaborador está escalado para embarque (mesmo que com flag CONF)
     def _is_embarcado_dia(p_nome: str, p_iso: str) -> bool:
         st_val = escalas_map.get((p_nome, p_iso))
+        if st_val == "EMP":
+            return False  # Emprestado para outra plataforma; NÃO conta nesta unidade!
         if st_val in ("EMB", "E"):
             return True
         if st_val == "CONF":
@@ -1873,47 +2213,71 @@ def build_scala_html(
                 return True
         return False
 
-    soma_emb_dia = {}
-    for dia in range(1, num_dias + 1):
-        iso_dt = f"{ano:04d}-{mes:02d}-{dia:02d}"
-        soma_emb_dia[dia] = sum(
-            1 for m in membros_filtrados
-            if _is_embarcado_dia(m["nome"], iso_dt)
-        )
+    soma_total_dia = {}
+    soma_mec_dia = {}
+    soma_inst_dia = {}
+    soma_elet_dia = {}
+
+    for idx_dia, dt in enumerate(lista_dias):
+        iso_dt = dt.strftime("%Y-%m-%d")
+        tot = 0
+        mec = 0
+        inst = 0
+        elet = 0
+        for m in membros_filtrados:
+            if _is_embarcado_dia(m["nome"], iso_dt):
+                tot += 1
+                d_m = m.get("disciplina", "")
+                if is_mecanica(d_m):
+                    mec += 1
+                elif is_instrumentacao(d_m):
+                    inst += 1
+                elif is_eletrica(d_m):
+                    elet += 1
+        soma_total_dia[idx_dia] = tot
+        soma_mec_dia[idx_dia] = mec
+        soma_inst_dia[idx_dia] = inst
+        soma_elet_dia[idx_dia] = elet
 
     embarques_turma = []
     for m in membros_filtrados:
         nome = m["nome"]
         disc = m["disciplina"]
-        dias_emb = [d for d in range(1, num_dias + 1) if _is_embarcado_dia(nome, f"{ano:04d}-{mes:02d}-{d:02d}")]
-        if not dias_emb:
+        cols_emb = [idx for idx, dt in enumerate(lista_dias) if _is_embarcado_dia(nome, dt.strftime("%Y-%m-%d"))]
+        if not cols_emb:
             continue
         blocos = []
-        b_ini = dias_emb[0]
-        b_fim = dias_emb[0]
-        for d in dias_emb[1:]:
-            if d == b_fim + 1:
-                b_fim = d
+        b_ini = cols_emb[0]
+        b_fim = cols_emb[0]
+        for c in cols_emb[1:]:
+            if c == b_fim + 1:
+                b_fim = c
             else:
                 blocos.append((b_ini, b_fim))
-                b_ini = d
-                b_fim = d
+                b_ini = c
+                b_fim = c
         blocos.append((b_ini, b_fim))
         embarques_turma.append({
             "nome": nome,
             "disciplina": disc,
             "is_externo": m.get("is_externo", False),
             "projeto": m.get("projeto", "Outro"),
+            "regime_folga": m.get("regime_folga", "14x21"),
             "blocos": blocos
         })
 
-    ordem_disc_turma = {"Mecânica": 1, "Instrumentação": 2, "Elétrica": 3, "Engenharia": 4}
-    embarques_turma.sort(key=lambda x: (ordem_disc_turma.get(x["disciplina"], 9), x["blocos"][0][0], x["nome"]))
+    def _ord_disc(d):
+        if is_mecanica(d): return 1
+        if is_instrumentacao(d): return 2
+        if is_eletrica(d): return 3
+        return 4
 
-    # 1. Cabeçalho da Divisão Turma a Bordo
+    embarques_turma.sort(key=lambda x: (_ord_disc(x["disciplina"]), x["blocos"][0][0], x["nome"]))
+
+    # 1. Cabeçalho da Divisão de Turma a Bordo
     grid_cells.append(
         f'<div class="discipline-header turma-header">'
-        f'<span>🚢 DIVISÃO DE TURMA A BORDO ({len(embarques_turma)} profissionais a bordo no mês)</span>'
+        f'<span>🚢 DIVISÃO DE TURMA A BORDO ({len(embarques_turma)} profissionais a bordo no período)</span>'
         f'<span class="turma-legenda-mini">'
         f'<span class="turma-chip-legenda" style="background:#0284c7;">Mecânica</span>'
         f'<span class="turma-chip-legenda" style="background:#ea580c;">Instrumentação</span>'
@@ -1922,38 +2286,58 @@ def build_scala_html(
         f'</div>'
     )
 
-    # 2. Linha de SOMA DIA A DIA
-    grid_cells.append('<div class="cell head label" style="background:#e0f2fe;color:#0369a1;font-weight:700;font-size:11px;border-bottom:2px solid #0284c7;">📊 TOTAL A BORDO (SOMA)</div>')
-    for dia in range(1, num_dias + 1):
-        qtd_d = soma_emb_dia[dia]
-        iso_dt = f"{ano:04d}-{mes:02d}-{dia:02d}"
-        dt = date(ano, mes, dia)
-        is_wk = dt.weekday() in [5, 6]
-        wk_cls = " weekend" if is_wk else ""
-        today_cls = " today" if iso_dt == hoje_iso else ""
-        if qtd_d > 0:
-            grid_cells.append(
-                f'<div class="cell head{wk_cls}{today_cls}" style="background:#f0f9ff;color:#0369a1;font-weight:bold;font-size:13px;border-bottom:2px solid #0284c7;" title="{qtd_d} pessoas a bordo em {dia:02d}/{mes:02d}">{qtd_d}</div>'
-            )
-        else:
-            grid_cells.append(
-                f'<div class="cell head{wk_cls}{today_cls}" style="background:#f8fafc;color:#94a3b8;font-size:11px;border-bottom:2px solid #0284c7;">0</div>'
-            )
+    # 2. Linhas de Resumo Diário com Formatação Condicional de Metas Mínimas
+    def _render_linha_resumo(titulo: str, dict_soma: Dict[int, int], min_val: int, cor_bg: str, cor_txt: str):
+        meta_badge = f' <span style="font-size:9px;background:#ffffff;padding:1px 5px;border-radius:3px;border:1px solid #cbd5e1;color:#334155;">Mín: {min_val}</span>' if min_val > 0 else ""
+        grid_cells.append(
+            f'<div class="cell head label" style="background:{cor_bg};color:{cor_txt};font-weight:700;font-size:10.5px;border-bottom:1px solid #cbd5e1;">'
+            f'{titulo}{meta_badge}</div>'
+        )
+        for idx_dia, dt in enumerate(lista_dias):
+            qtd = dict_soma[idx_dia]
+            iso_dt = dt.strftime("%Y-%m-%d")
+            is_wk = dt.weekday() in [5, 6]
+            wk_cls = " weekend" if is_wk else ""
+            today_cls = " today" if iso_dt == hoje_iso else ""
+            is_month_end = (idx_dia == total_dias - 1) or (lista_dias[idx_dia + 1].month != dt.month)
+            month_end_cls = " border-month-end" if is_month_end else ""
+
+            if min_val > 0 and qtd < min_val:
+                grid_cells.append(
+                    f'<div class="cell head vagas-alerta{wk_cls}{today_cls}{month_end_cls}" '
+                    f'title="⚠️ Alerta: {qtd} a bordo em {dt.strftime("%d/%m/%Y")} (Mínimo exigido: {min_val})">'
+                    f'⚠️{qtd}</div>'
+                )
+            elif qtd > 0:
+                grid_cells.append(
+                    f'<div class="cell head{wk_cls}{today_cls}{month_end_cls}" style="background:#f0f9ff;color:{cor_txt};font-weight:bold;font-size:12px;border-bottom:1px solid #cbd5e1;" '
+                    f'title="{qtd} em {dt.strftime("%d/%m/%Y")}">{qtd}</div>'
+                )
+            else:
+                grid_cells.append(
+                    f'<div class="cell head{wk_cls}{today_cls}{month_end_cls}" style="background:#f8fafc;color:#94a3b8;font-size:11px;border-bottom:1px solid #cbd5e1;">0</div>'
+                )
+
+    _render_linha_resumo("📊 TOTAL A BORDO (SOMA)", soma_total_dia, min_tot, "#e0f2fe", "#0369a1")
+    _render_linha_resumo("🔧 MECÂNICA A BORDO", soma_mec_dia, min_mec, "#f0fdf4", "#15803d")
+    _render_linha_resumo("⚡ ELÉTRICA A BORDO", soma_elet_dia, min_elet, "#fefce8", "#a16207")
+    _render_linha_resumo("🎛️ INSTRUMENTAÇÃO A BORDO", soma_inst_dia, min_inst, "#fff7ed", "#c2410c")
 
     # 3. Linhas individuais com balão contínuo por período de embarque
     for item in embarques_turma:
         nome = item["nome"]
         disc = item["disciplina"]
-        disc_upper = disc.upper()
-        if "MEC" in disc_upper:
+        reg_colab = item.get("regime_folga", "14x21")
+
+        if is_mecanica(disc):
             bg_balao = "#0284c7"
             borda_balao = "#0369a1"
             text_balao = "#ffffff"
-        elif "INST" in disc_upper:
+        elif is_instrumentacao(disc):
             bg_balao = "#ea580c"
             borda_balao = "#c2410c"
             text_balao = "#ffffff"
-        elif "ELET" in disc_upper:
+        elif is_eletrica(disc):
             bg_balao = "#eab308"
             borda_balao = "#ca8a04"
             text_balao = "#1e293b"
@@ -1967,49 +2351,51 @@ def build_scala_html(
             f'<div class="cell label"><span>{nome}</span><small style="color:#64748b;font-weight:normal;font-size:9px;">{disc}</small>{badge_ext}</div>'
         )
 
-        nome_js = nome.replace("'", "\\'")
-        disc_js = disc.replace("'", "\\'")
+        nome_js = nome.replace("'", "\'")
+        disc_js = disc.replace("'", "\'")
 
         curr_col = 2
         for (b_ini, b_fim) in item["blocos"]:
-            span_vazio = (b_ini + 1) - curr_col
+            span_vazio = (b_ini + 2) - curr_col
             if span_vazio > 0:
                 grid_cells.append(f'<div class="cell" style="grid-column: {curr_col} / span {span_vazio}; border-right:1px solid #dfe6eb; border-bottom:1px solid #dfe6eb;"></div>')
 
             span_balao = b_fim - b_ini + 1
-            iso_b_ini = f"{ano:04d}-{mes:02d}-{b_ini:02d}"
-            iso_b_fim = f"{ano:04d}-{mes:02d}-{b_fim:02d}"
+            dt_b_ini = lista_dias[b_ini]
+            dt_b_fim = lista_dias[b_fim]
+            iso_b_ini = dt_b_ini.strftime("%Y-%m-%d")
+            iso_b_fim = dt_b_fim.strftime("%Y-%m-%d")
 
             periodo_b = mapa_dia_periodo.get((nome, iso_b_ini))
             if periodo_b:
                 p_ini_modal = periodo_b["inicio"].strftime("%Y-%m-%d")
                 p_fim_modal = periodo_b["fim"].strftime("%Y-%m-%d")
-                obs_modal = (periodo_b.get("observacao") or "").replace("'", "\\'")
+                obs_modal = (periodo_b.get("observacao") or "").replace("'", "\'")
             else:
                 p_ini_modal = iso_b_ini
                 p_fim_modal = iso_b_fim
                 obs_modal = ""
 
-            tooltip_balao = f"{nome} ({disc}) — Embarcado de {b_ini:02d}/{mes:02d} a {b_fim:02d}/{mes:02d} ({span_balao} dias)"
-            onclick_balao = f"onclick=\"abrirModalEdicao('{nome_js}', '{disc_js}', '{projeto}', '{p_ini_modal}', '{p_fim_modal}', 'EMB', '{obs_modal}', false)\"" if is_editor else ""
+            tooltip_balao = f"{nome} ({disc}) — Embarcado de {dt_b_ini:%d/%m} a {dt_b_fim:%d/%m} ({span_balao} dias)"
+            onclick_balao = f'onclick="abrirModalEdicao(\'{nome_js}\', \'{disc_js}\', \'{projeto}\', \'{p_ini_modal}\', \'{p_fim_modal}\', \'EMB\', \'{obs_modal}\', false, \'{reg_colab}\')"' if is_editor else ""
             cursor_balao = "cursor:pointer;" if is_editor else "cursor:default;"
 
             grid_cells.append(
-                f'<div class="turma-balao" style="grid-column: {b_ini + 1} / span {span_balao}; background:{bg_balao}; border:1px solid {borda_balao}; color:{text_balao}; {cursor_balao}" '
+                f'<div class="turma-balao" style="grid-column: {b_ini + 2} / span {span_balao}; background:{bg_balao}; border:1px solid {borda_balao}; color:{text_balao}; {cursor_balao}" '
                 f'{onclick_balao} title="{tooltip_balao}">'
                 f'<span>⚓ {nome} ({span_balao}d)</span>'
                 f'</div>'
             )
-            curr_col = b_fim + 2
+            curr_col = b_fim + 3
 
-        if curr_col <= num_dias + 1:
-            span_fim = (num_dias + 2) - curr_col
+        if curr_col <= total_dias + 1:
+            span_fim = (total_dias + 2) - curr_col
             grid_cells.append(f'<div class="cell" style="grid-column: {curr_col} / span {span_fim}; border-right:1px solid #dfe6eb; border-bottom:1px solid #dfe6eb;"></div>')
 
     if not embarques_turma:
         grid_cells.append(
             f'<div class="cell label" style="grid-column: 1 / -1;text-align:center;padding:16px;color:#64748b;font-style:italic;">'
-            f'Nenhum profissional com embarque ativo nesta unidade para {MESES_PT[mes-1]}/{ano}.'
+            f'Nenhum profissional com embarque ativo nesta unidade no período exibido.'
             f'</div>'
         )
 
@@ -2019,6 +2405,8 @@ def build_scala_html(
         )
 
     grid_body = "\n".join(grid_cells)
+
+    periodo_rotulo = f"{meses_info[0]['nome']} de {meses_info[0]['ano']}" if len(meses_info) == 1 else f"{meses_info[0]['nome']}/{meses_info[0]['ano']} a {meses_info[-1]['nome']}/{meses_info[-1]['ano']} (6 Meses)"
 
     html_completo = f"""<!doctype html>
 <html lang="pt-BR">
@@ -2030,9 +2418,9 @@ def build_scala_html(
 </head>
 <body>
     <div class="header-bar">
-        <span>Scala {projeto} — {MESES_PT[mes-1]} de {ano} <small style="font-size:11px;font-weight:normal;opacity:0.85;background:rgba(255,255,255,0.2);padding:2px 6px;border-radius:4px;margin-left:6px;">v0.1</small></span>
+        <span>Scala {projeto} — {periodo_rotulo} <small style="font-size:11px;font-weight:normal;opacity:0.85;background:rgba(255,255,255,0.2);padding:2px 6px;border-radius:4px;margin-left:6px;">v0.2</small></span>
         <span style="font-size:12px;font-weight:normal;opacity:0.95;">
-            Equipe Base: <strong>{qtd_nativos}</strong> | Externos no mês: <strong>{qtd_externos}</strong> | Total Linhas: <strong>{total_linhas}</strong>
+            Equipe Base: <strong>{qtd_nativos}</strong> | Externos: <strong>{qtd_externos}</strong> | Total Linhas: <strong>{total_linhas}</strong>
         </span>
     </div>
     {legenda_html}
@@ -2107,7 +2495,7 @@ def build_scala_html(
                     <div id="ap_feedback_box" class="p80-info-box" style="display:none;"></div>
                 </div>
 
-                <!-- SEÇÃO 2: EDIÇÃO REGULAR DE PERÍODO (Ativa para EMB, PMB, FÉR, BASE, TREIN, CONF ou Novo) -->
+                <!-- SEÇÃO 2: EDIÇÃO REGULAR DE PERÍODO (Ativa para EMB, PMB, FÉR, BASE, TREIN, LIC, CONF ou Novo) -->
                 <div id="secao_edicao_padrao" class="p80-modal-body">
                     <div class="p80-form-row">
                         <div class="p80-form-group">
@@ -2129,24 +2517,34 @@ def build_scala_html(
                             <option value="FÉR">FÉR - Férias</option>
                             <option value="BASE">BASE - Escritório / Base / Estaleiro</option>
                             <option value="TREIN">TREIN - Treinamento</option>
+                            <option value="LIC">LIC - Licença</option>
+                        </select>
+                    </div>
+
+                    <!-- SELEÇÃO DE REGIME DE FOLGA (14x21 vs 14x14) -->
+                    <div class="p80-form-group" id="box_regime_folga">
+                        <label for="m_regime_folga">⚖️ Projeção de Regime de Folga:</label>
+                        <select class="p80-select" name="p80_regime" id="m_regime_folga" onchange="atualizarRegraFolga()">
+                            <option value="14x21">14x21 (14 dias trab. / 21 dias folga — Fator 1.5x)</option>
+                            <option value="14x14">14x14 (14 dias trab. / 14 dias folga — Fator 1.0x)</option>
                         </select>
                     </div>
 
                     <div class="p80-form-group">
                         <label for="m_obs">📝 Observação (opcional):</label>
-                        <input type="text" class="p80-input" name="p80_obs" id="m_obs" placeholder="Ex: Embarque regular, estaleiro, substituição...">
+                        <input type="text" class="p80-input" name="p80_obs" id="m_obs" placeholder="Ex: Embarque regular, estaleiro, licença médica...">
                     </div>
 
                     <div id="m_info_box" class="p80-info-box">
                         ⚓ <strong>Regra 1,5x:</strong> Embarques (EMB) geram automaticamente dias de folga (FOL) na sequência.
                     </div>
 
-                    <!-- OPÇÃO DE ALOCAÇÃO EM ESCALA CÍCLICA 14x21 -->
+                    <!-- OPÇÃO DE ALOCAÇÃO EM ESCALA CÍCLICA -->
                     <div id="secao_opcao_ciclica" style="display:none;margin-top:8px;padding:10px 12px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;">
                         <div style="display:flex;align-items:center;gap:8px;">
                             <input type="checkbox" id="m_chk_ciclica" name="p80_is_ciclica" value="1" onchange="atualizarOpcaoCiclica()" style="width:16px;height:16px;cursor:pointer;">
                             <label for="m_chk_ciclica" style="font-size:12px;font-weight:700;color:#166534;cursor:pointer;margin:0;">
-                                🔄 Alocar em escala cíclica contínua (regime 14x21)
+                                🔄 Alocar em escala cíclica contínua (regime selecionado)
                             </label>
                         </div>
                         <div id="box_detalhe_ciclica" style="display:none;margin-top:8px;">
@@ -2178,6 +2576,34 @@ def build_scala_html(
         </div>
     </div>
 
+    <!-- MODAL POP-UP INFORMATIVO PARA COLABORADOR EMPRESTADO (EMP) -->
+    <div id="empModalOverlay" class="p80-modal-overlay">
+        <div class="p80-modal-card">
+            <div class="p80-modal-head" style="background:#4338ca;">
+                <div>
+                    <h3>🚢 Colaborador Emprestado</h3>
+                    <div class="p80-modal-subtitle" id="emp_subtitle">Alocação Externa Offshore</div>
+                </div>
+                <button type="button" class="p80-modal-close-btn" onclick="fecharModalEmp()">&times;</button>
+            </div>
+            <div class="p80-modal-body">
+                <div style="background:#eef2ff;border:1px solid #c7d2fe;padding:12px 14px;border-radius:8px;color:#3730a3;font-size:13px;line-height:1.5;">
+                    <p style="margin:0 0 6px 0;"><strong>Colaborador da Equipe Base:</strong> <span id="emp_nome" style="font-weight:700;"></span></p>
+                    <p style="margin:0 0 6px 0;">Este profissional está <strong>emprestado</strong> e escalado como embarcado na unidade:</p>
+                    <p style="margin:0 0 8px 0;font-size:15px;font-weight:bold;color:#1e1b4b;" id="emp_dest"></p>
+                    <p style="margin:0;font-size:12px;color:#4338ca;"><strong>Período de Embarque:</strong> <span id="emp_periodo"></span></p>
+                </div>
+                <div style="font-size:11.5px;color:#64748b;line-height:1.4;">
+                    ℹ️ O colaborador aparece como <strong>Externo (Ext)</strong> na unidade de destino e com o status <strong>Emprestado (EMP)</strong> em sua unidade nativa. Ele não pontua na soma de pessoas a bordo desta unidade.
+                </div>
+            </div>
+            <div class="p80-modal-foot">
+                <button type="button" class="p80-btn p80-btn-cancel" onclick="fecharModalEmp()">Fechar</button>
+                <a id="emp_nav_btn" href="#" target="_top" class="p80-btn p80-btn-primary" style="background:#4338ca;">Ir para a Escala da Unidade ➔</a>
+            </div>
+        </div>
+    </div>
+
     <script>
         var modalOverlay = document.getElementById('p80ModalOverlay');
         var mNome = document.getElementById('m_nome');
@@ -2192,6 +2618,8 @@ def build_scala_html(
         var mDtIni = document.getElementById('m_dt_ini');
         var mDtFim = document.getElementById('m_dt_fim');
         var mStatus = document.getElementById('m_status');
+        var mRegimeFolga = document.getElementById('m_regime_folga');
+        var boxRegimeFolga = document.getElementById('box_regime_folga');
         var mObs = document.getElementById('m_obs');
         var mInfoBox = document.getElementById('m_info_box');
         var btnExcluir = document.getElementById('btn_modal_excluir');
@@ -2223,8 +2651,10 @@ def build_scala_html(
                 if (k < 1) k = 1;
                 var ini = new Date(mDtIni.value + 'T00:00:00');
                 var iniText = (!isNaN(ini.getTime())) ? mDtIni.value : 'data inicial';
-                var totalDias = k * 35;
-                msgCiclicaPreview.innerHTML = '⚓ <strong>Escala 14x21:</strong> Serão criados <strong>' + k + ' ciclos consecutivos</strong> de 14 dias de embarque (EMB) e 21 dias de folga (FOL) a partir de ' + iniText + ' (duração total: ' + totalDias + ' dias).';
+                var reg = (mRegimeFolga && mRegimeFolga.value) ? mRegimeFolga.value : '14x21';
+                var diasFolga = (reg === '14x14') ? 14 : 21;
+                var totalDias = k * (14 + diasFolga);
+                msgCiclicaPreview.innerHTML = '⚓ <strong>Escala ' + reg + ':</strong> Serão criados <strong>' + k + ' ciclos consecutivos</strong> de 14 dias de embarque (EMB) e ' + diasFolga + ' dias de folga (FOL) a partir de ' + iniText + ' (duração total: ' + totalDias + ' dias).';
             }} else {{
                 boxDetalheCiclica.style.display = 'none';
                 msgCiclicaPreview.innerHTML = '';
@@ -2236,7 +2666,6 @@ def build_scala_html(
             if (!form) return;
             var formData = new FormData(form);
 
-            // 1. Tenta criar e submeter formulário invisível no documento pai (mesma origem, contorna sandbox do iframe)
             try {{
                 var topDoc = window.parent.document;
                 var topWin = window.parent;
@@ -2258,10 +2687,9 @@ def build_scala_html(
                 topForm.submit();
                 return;
             }} catch(e1) {{
-                console.warn("Submissão via topForm no documento pai falhou:", e1);
+                console.warn("Submissão via topForm falhou:", e1);
             }}
 
-            // 2. Fallback via injeção de script executado no contexto do documento pai
             try {{
                 var topDoc = window.parent.document;
                 var topWin = window.parent;
@@ -2275,10 +2703,9 @@ def build_scala_html(
                 scriptElem.remove();
                 return;
             }} catch(e2) {{
-                console.warn("Navegação via script injection falhou:", e2);
+                console.warn("Navegação via script falhou:", e2);
             }}
 
-            // 3. Fallback via <a> clicado no documento pai
             try {{
                 var topDoc = window.parent.document;
                 var topWin = window.parent;
@@ -2295,7 +2722,6 @@ def build_scala_html(
                 console.warn("Navegação via <a> falhou:", e3);
             }}
 
-            // 4. Fallback direto local
             try {{
                 form.action = window.location.pathname || '/';
                 form.submit();
@@ -2316,20 +2742,33 @@ def build_scala_html(
             var dias = Math.round((fim - ini) / (1000 * 60 * 60 * 24)) + 1;
             var obsText = (mObs && mObs.value) ? mObs.value : '';
             var temConflito = (st === 'CONF' || obsText.indexOf('CONFLITO') >= 0 || obsText.indexOf(' vs ') >= 0);
+
             if (temConflito) {{
+                if (boxRegimeFolga) boxRegimeFolga.style.display = 'none';
                 mInfoBox.innerHTML = '⚠️ <strong>Conflito Detectado:</strong> ' + (obsText || 'Divergência entre Escala e Cronograma.');
                 mInfoBox.style.background = '#fef2f2';
                 mInfoBox.style.borderColor = '#fca5a5';
                 mInfoBox.style.color = '#991b1b';
                 mInfoBox.style.display = 'block';
             }} else if (st === 'EMB') {{
-                var folgas = Math.ceil(dias * 1.5);
-                mInfoBox.innerHTML = '⚓ <strong>Regra 1,5x:</strong> O embarque de <strong>' + dias + ' dias</strong> gerará automaticamente <strong>' + folgas + ' dias de folga (FOL)</strong> projetados na sequência.';
+                if (boxRegimeFolga) boxRegimeFolga.style.display = 'block';
+                var reg = (mRegimeFolga && mRegimeFolga.value) ? mRegimeFolga.value : '14x21';
+                var folgas = (reg === '14x14') ? dias : Math.ceil(dias * 1.5);
+                var descReg = (reg === '14x14') ? '1,0x (14x14)' : '1,5x (14x21)';
+                mInfoBox.innerHTML = '⚓ <strong>Regra ' + descReg + ':</strong> O embarque de <strong>' + dias + ' dias</strong> gerará automaticamente <strong>' + folgas + ' dias de folga (FOL)</strong> projetados na sequência.';
                 mInfoBox.style.background = '#f0fdf4';
                 mInfoBox.style.borderColor = '#bbf7d0';
                 mInfoBox.style.color = '#166534';
                 mInfoBox.style.display = 'block';
+            }} else if (st === 'LIC') {{
+                if (boxRegimeFolga) boxRegimeFolga.style.display = 'none';
+                mInfoBox.innerHTML = '🏥 <strong>Licença:</strong> Ocupa o período de <strong>' + dias + ' dias</strong> sem gerar projeção automática de folga.';
+                mInfoBox.style.background = '#fff1f2';
+                mInfoBox.style.borderColor = '#fecdd3';
+                mInfoBox.style.color = '#9f1239';
+                mInfoBox.style.display = 'block';
             }} else {{
+                if (boxRegimeFolga) boxRegimeFolga.style.display = 'none';
                 mInfoBox.innerHTML = '📅 Período selecionado: <strong>' + dias + ' dias</strong> com status <strong>' + st + '</strong>.';
                 mInfoBox.style.background = '#f8fafc';
                 mInfoBox.style.borderColor = '#cbd5e1';
@@ -2407,7 +2846,7 @@ def build_scala_html(
             }}
         }}
 
-        function abrirModalEdicao(nome, disc, proj, p_ini, p_fim, p_st, obs, is_novo) {{
+        function abrirModalEdicao(nome, disc, proj, p_ini, p_fim, p_st, obs, is_novo, reg_colab) {{
             if (!modalOverlay) return;
             mNome.value = nome;
             mDisc.value = disc;
@@ -2415,6 +2854,10 @@ def build_scala_html(
             mIniAnt.value = p_ini;
             mFimAnt.value = p_fim;
             mIsNovo.value = is_novo ? '1' : '0';
+
+            if (mRegimeFolga) {{
+                mRegimeFolga.value = (reg_colab === '14x14') ? '14x14' : '14x21';
+            }}
 
             var st_limpo = (p_st === 'E' ? 'EMB' : (p_st || 'EMB'));
             mStatus.value = st_limpo;
@@ -2440,7 +2883,6 @@ def build_scala_html(
                     if (secaoOpcaoCiclica) secaoOpcaoCiclica.style.display = 'none';
                 }}
             }} else if (st_limpo === 'FOL') {{
-                // Ativa modo especial AUTO-PERMUTA para Folgas
                 modoAtualAutoPermuta = true;
                 secaoAutoPermuta.style.display = 'block';
                 secaoEdicaoPadrao.style.display = 'none';
@@ -2479,17 +2921,45 @@ def build_scala_html(
             }}
         }}
 
+        function abrirModalEmprestado(nome, destProj, dtIni, dtFim) {{
+            var overlay = document.getElementById('empModalOverlay');
+            var elNome = document.getElementById('emp_nome');
+            var elDest = document.getElementById('emp_dest');
+            var elPeriodo = document.getElementById('emp_periodo');
+            var elBtn = document.getElementById('emp_nav_btn');
+            if (!overlay) return;
+            if (elNome) elNome.innerText = nome;
+            if (elDest) elDest.innerText = destProj;
+            if (elPeriodo) elPeriodo.innerText = dtIni + ' a ' + dtFim;
+            if (elBtn) {{
+                elBtn.href = '?tab=' + encodeURIComponent('Escala ' + destProj);
+                elBtn.innerText = 'Ir para a Escala da ' + destProj + ' ➔';
+            }}
+            overlay.style.display = 'flex';
+        }}
+
+        function fecharModalEmp() {{
+            var overlay = document.getElementById('empModalOverlay');
+            if (overlay) overlay.style.display = 'none';
+        }}
+
         if (modalOverlay) {{
             modalOverlay.addEventListener('click', function(e) {{
-                if (e.target === modalOverlay) {{
-                    fecharModal();
-                }}
+                if (e.target === modalOverlay) fecharModal();
+            }});
+        }}
+
+        var empOverlay = document.getElementById('empModalOverlay');
+        if (empOverlay) {{
+            empOverlay.addEventListener('click', function(e) {{
+                if (e.target === empOverlay) fecharModalEmp();
             }});
         }}
 
         document.addEventListener('keydown', function(e) {{
             if (e.key === 'Escape' || e.key === 'Esc') {{
                 fecharModal();
+                fecharModalEmp();
             }}
         }});
 
@@ -2565,7 +3035,6 @@ def build_scala_html(
                 dtFimVal = apOrigFim.value.trim();
             }}
 
-            // Se o usuário digitou ou estendeu datas visíveis no formulário, respeita a escolha
             var ini = dtIniVal || iniAntVal;
             var fim = dtFimVal || fimAntVal;
 
@@ -2603,25 +3072,33 @@ def build_scala_html(
     return html_completo
 
 
-# --- CALLBACKS DE NAVEGAÇÃO TEMPORAL (MÊS / ANO) ----------------------------
-def _nav_mudar_mes(pfx_nav: str, delta: int):
-    """Callback para os botões Mês Anterior (-1) e Próximo Mês (+1), mantendo selectbox e estado sincronizados."""
+# --- CALLBACKS DE NAVEGAÇÃO TEMPORAL (MÊS / ANO / 6 MESES) -------------------
+def _nav_mudar_meses(pfx_nav: str, delta: int):
+    """Callback para navegação temporal por delta de meses (+1, -1, +6, -6)."""
     k_m = f"{pfx_nav}_mes"
     k_y = f"{pfx_nav}_ano"
     cur_m = st.session_state.get(k_m, date.today().month)
     cur_y = st.session_state.get(k_y, date.today().year)
-    novo_m = cur_m + delta
-    novo_y = cur_y
-    if novo_m < 1:
-        novo_m = 12
-        novo_y -= 1
-    elif novo_m > 12:
-        novo_m = 1
-        novo_y += 1
+    total_m = (cur_y * 12 + (cur_m - 1)) + delta
+    novo_y = total_m // 12
+    novo_m = (total_m % 12) + 1
     st.session_state[k_m] = novo_m
     st.session_state[k_y] = novo_y
     st.session_state[f"{pfx_nav}_sel_mes"] = novo_m
     st.session_state[f"{pfx_nav}_sel_ano"] = novo_y
+
+
+def _nav_ir_mes_atual(pfx_nav: str):
+    """Callback para pular diretamente para o mês atual."""
+    hoje = date.today()
+    st.session_state[f"{pfx_nav}_mes"] = hoje.month
+    st.session_state[f"{pfx_nav}_ano"] = hoje.year
+    st.session_state[f"{pfx_nav}_sel_mes"] = hoje.month
+    st.session_state[f"{pfx_nav}_sel_ano"] = hoje.year
+
+
+def _nav_mudar_mes(pfx_nav: str, delta: int):
+    _nav_mudar_meses(pfx_nav, delta)
 
 
 def _nav_on_change_mes(pfx_nav: str):
@@ -2659,6 +3136,13 @@ def render_aba_escala_projeto(
         disc_act = params.get("p80_disc", "Mecânica")
         obs_act = params.get("p80_obs", "")
         is_novo = params.get("p80_is_novo") == "1"
+
+        # Trata seleção de regime de folga (14x21 vs 14x14)
+        reg_act = params.get("p80_regime")
+        if reg_act in ("14x21", "14x14"):
+            EscalaP80DB.set_regime_colaborador(nome_act, reg_act)
+        else:
+            reg_act = EscalaP80DB.get_regime_colaborador(nome_act)
 
         # Sincroniza mês e ano ativos se enviados pelo modal
         if params.get("p80_mes"):
@@ -2705,15 +3189,16 @@ def render_aba_escala_projeto(
                 st_act = normalizar_status(params.get("p80_st", "EMB"))
 
                 if is_novo and is_ciclica and st_act == "EMB":
-                    d_s, d_f = EscalaP80DB.salvar_escala_ciclica_14x21(
+                    d_s, d_f = EscalaP80DB.salvar_escala_ciclica(
                         nome=nome_act,
                         disciplina=disc_act,
                         projeto=proj_norm,
                         d_inicio=d_ini_act,
                         qtd_ciclos=qtd_c,
-                        observacao=obs_act
+                        observacao=obs_act,
+                        regime=reg_act
                     )
-                    st.toast(f"Escala 14x21 de {nome_act} lançada com sucesso! ({qtd_c} ciclos: {d_s} dias de EMB e {d_f} dias de FOL).", icon="⚓")
+                    st.toast(f"Escala contínua {reg_act} de {nome_act} lançada! ({qtd_c} ciclos: {d_s} dias EMB e {d_f} dias FOL).", icon="⚓")
                 elif is_novo:
                     d_fim_act = datetime.strptime(params.get("p80_fim", ""), "%Y-%m-%d").date()
                     d_s, d_f = EscalaP80DB.salvar_escala_periodo(
@@ -2723,11 +3208,12 @@ def render_aba_escala_projeto(
                         d_inicio=d_ini_act,
                         d_fim=d_fim_act,
                         status=st_act,
-                        observacao=obs_act
+                        observacao=obs_act,
+                        regime_folga=reg_act
                     )
                     msg = f"Escala de {nome_act} lançada com sucesso ({d_s} dias de '{st_act}')."
                     if d_f > 0:
-                        msg += f" Projeção automática gerada: {d_f} dias de folga (FOL)."
+                        msg += f" Projeção ({reg_act}): {d_f} dias de folga (FOL)."
                     st.toast(msg, icon="✅")
                 else:
                     d_fim_act = datetime.strptime(params.get("p80_fim", ""), "%Y-%m-%d").date()
@@ -2744,11 +3230,12 @@ def render_aba_escala_projeto(
                         d_ini_novo=d_ini_act,
                         d_fim_novo=d_fim_act,
                         status_novo=st_act,
-                        observacao=obs_act
+                        observacao=obs_act,
+                        regime_folga=reg_act
                     )
                     msg = f"Período de {nome_act} atualizado ({d_s} dias de '{st_act}')."
                     if d_f > 0:
-                        msg += f" Folgas recalculadas: {d_f} dias (FOL)."
+                        msg += f" Folgas recalculadas ({reg_act}): {d_f} dias (FOL)."
                     st.toast(msg, icon="✅")
 
             elif act == "excluir":
@@ -2820,7 +3307,7 @@ def render_aba_escala_projeto(
     mes_atual = st.session_state[key_mes]
     is_editor = st.session_state["escala_is_editor"]
 
-    # --- BARRA DE CONTROLE: MODO & AUTENTICAÇÃO (100% ESTÁVEL, SEM RESET ACIDENTAL) ---
+    # --- BARRA DE CONTROLE: MODO & AUTENTICAÇÃO ---
     c_modo, c_sync, c_status = st.columns([3, 1.5, 2.5])
 
     with c_modo:
@@ -2866,71 +3353,74 @@ def render_aba_escala_projeto(
 
     st.divider()
 
-    # --- BARRA DE NAVEGAÇÃO TEMPORAL E FILTROS ---
-    col_nav1, col_nav2, col_nav3, col_nav4, col_nav5 = st.columns([1, 2, 1.5, 1, 3.5])
+    # --- BARRA DE NAVEGAÇÃO TEMPORAL (6 MESES, MÊS A MÊS, CONFIG DE VAGAS E BUSCA) ---
+    c_n1, c_n2, c_n3, c_n4, c_n5, c_n6, c_n7, c_n8, c_n9 = st.columns([1, 0.9, 1.1, 0.9, 1, 1.6, 1.2, 1.3, 3])
 
-    with col_nav1:
-        st.button(
-            "◀ Mês Ant.",
-            use_container_width=True,
-            key=f"{pfx}_prev_m",
-            on_click=_nav_mudar_mes,
-            args=(pfx, -1)
-        )
+    with c_n1:
+        st.button("⏪ -6 Meses", use_container_width=True, key=f"{pfx}_p6m", on_click=_nav_mudar_meses, args=(pfx, -6), help="Retrocede 6 meses na janela contínua")
+    with c_n2:
+        st.button("◀ -1 Mês", use_container_width=True, key=f"{pfx}_p1m", on_click=_nav_mudar_meses, args=(pfx, -1), help="Retrocede 1 mês")
+    with c_n3:
+        st.button("📍 Mês Atual", use_container_width=True, key=f"{pfx}_p_today", on_click=_nav_ir_mes_atual, args=(pfx,), help="Retorna imediatamente ao mês atual")
+    with c_n4:
+        st.button("+1 Mês ▶", use_container_width=True, key=f"{pfx}_n1m", on_click=_nav_mudar_meses, args=(pfx, 1), help="Avança 1 mês")
+    with c_n5:
+        st.button("+6 Meses ⏩", use_container_width=True, key=f"{pfx}_n6m", on_click=_nav_mudar_meses, args=(pfx, 6), help="Avança 6 meses na janela contínua")
+    with c_n6:
+        st.selectbox("Mês Inicial", range(1, 13), format_func=lambda m: f"{m:02d} - {MESES_PT[m-1]}", label_visibility="collapsed", key=key_sel_mes, on_change=_nav_on_change_mes, args=(pfx,))
+    with c_n7:
+        st.selectbox("Ano Inicial", list(range(2024, 2031)), label_visibility="collapsed", key=key_sel_ano, on_change=_nav_on_change_ano, args=(pfx,))
+    with c_n8:
+        config_vagas = EscalaP80DB.get_config_vagas(proj_norm)
+        with st.popover("⚙️ Vagas Mín.", use_container_width=True):
+            st.markdown(f"**Vagas Mínimas — {proj_norm}**")
+            st.caption("Efetivo mínimo diário a bordo. Valores abaixo do mínimo configurado serão sinalizados em vermelho no resumo diário.")
+            cfg_m = st.number_input("Mecânica Mínima:", min_value=0, max_value=50, value=int(config_vagas.get("min_mecanica", 0)), step=1, key=f"{pfx}_inp_min_mec")
+            cfg_e = st.number_input("Elétrica Mínima:", min_value=0, max_value=50, value=int(config_vagas.get("min_eletrica", 0)), step=1, key=f"{pfx}_inp_min_elet")
+            cfg_i = st.number_input("Instrumentação Mínima:", min_value=0, max_value=50, value=int(config_vagas.get("min_instrumentacao", 0)), step=1, key=f"{pfx}_inp_min_inst")
+            cfg_t = st.number_input("Total Mínimo a Bordo:", min_value=0, max_value=150, value=int(config_vagas.get("min_total", 0)), step=1, key=f"{pfx}_inp_min_tot")
+            if st.button("💾 Salvar Parâmetros", key=f"{pfx}_btn_save_cfg_vagas", type="primary", use_container_width=True):
+                EscalaP80DB.set_config_vagas(proj_norm, int(cfg_m), int(cfg_i), int(cfg_e), int(cfg_t))
+                st.toast("Parâmetros de vagas mínimas atualizados com sucesso!", icon="✅")
+                st.rerun()
+    with c_n9:
+        filtro_pesquisa = st.text_input("Buscar", placeholder=f"Filtrar colaborador ou disciplina em {proj_norm}...", label_visibility="collapsed", key=f"{pfx}_filter_input")
 
-    with col_nav2:
-        st.selectbox(
-            "Mês",
-            range(1, 13),
-            format_func=lambda m: f"{m:02d} - {MESES_PT[m-1]}",
-            label_visibility="collapsed",
-            key=key_sel_mes,
-            on_change=_nav_on_change_mes,
-            args=(pfx,)
-        )
+    # --- CÁLCULO DA JANELA DE 6 MESES CONTÍNUOS ---
+    meses_info = []
+    c_ano, c_mes = ano_atual, mes_atual
+    for _ in range(6):
+        _, n_d = calendar.monthrange(c_ano, c_mes)
+        meses_info.append({
+            "ano": c_ano,
+            "mes": c_mes,
+            "nome": MESES_PT[c_mes - 1],
+            "dias": n_d
+        })
+        c_mes += 1
+        if c_mes > 12:
+            c_mes = 1
+            c_ano += 1
 
-    with col_nav3:
-        anos_disponiveis = list(range(2024, 2031))
-        st.selectbox(
-            "Ano",
-            anos_disponiveis,
-            label_visibility="collapsed",
-            key=key_sel_ano,
-            on_change=_nav_on_change_ano,
-            args=(pfx,)
-        )
+    lista_dias = []
+    for m_inf in meses_info:
+        for d in range(1, m_inf["dias"] + 1):
+            lista_dias.append(date(m_inf["ano"], m_inf["mes"], d))
 
-    with col_nav4:
-        st.button(
-            "Próx. Mês ▶",
-            use_container_width=True,
-            key=f"{pfx}_next_m",
-            on_click=_nav_mudar_mes,
-            args=(pfx, 1)
-        )
-
-    with col_nav5:
-        filtro_pesquisa = st.text_input(
-            "Buscar",
-            placeholder=f"Filtrar colaborador ou disciplina em {proj_norm}...",
-            label_visibility="collapsed",
-            key=f"{pfx}_filter_input"
-        )
-
-    # Dados do mês
-    _, dias_no_mes = calendar.monthrange(ano_atual, mes_atual)
-    d_inicio_mes = f"{ano_atual:04d}-{mes_atual:02d}-01"
-    d_fim_mes = f"{ano_atual:04d}-{mes_atual:02d}-{dias_no_mes:02d}"
+    d_inicio_window = lista_dias[0]
+    d_fim_window = lista_dias[-1]
+    d_inicio_window_str = d_inicio_window.strftime("%Y-%m-%d")
+    d_fim_window_str = d_fim_window.strftime("%Y-%m-%d")
 
     membros, qtd_nativos, qtd_externos = EscalaP80DB.get_membros_para_escala(
         projeto=proj_norm,
-        d_inicio_mes=d_inicio_mes,
-        d_fim_mes=d_fim_mes
+        d_inicio_mes=d_inicio_window_str,
+        d_fim_mes=d_fim_window_str
     )
-    escalas_map = EscalaP80DB.get_escalas_periodo(proj_norm, d_inicio_mes, d_fim_mes)
+    escalas_map = EscalaP80DB.get_escalas_periodo(proj_norm, d_inicio_window_str, d_fim_window_str)
     todos_periodos, mapa_dia_periodo = EscalaP80DB.get_periodos_agrupados(proj_norm)
 
-    # Integra dados do cronograma e detecta conflitos
+    # Integra dados do cronograma e detecta conflitos para toda a janela de 6 meses
     escalas_map, mapa_dia_periodo, lista_conflitos, membros, qtd_externos = integrar_escalas_com_cronograma(
         escalas_map=escalas_map,
         mapa_dia_periodo=mapa_dia_periodo,
@@ -2938,42 +3428,40 @@ def render_aba_escala_projeto(
         cronograma_df=cronograma_df,
         proj_norm=proj_norm,
         ano=ano_atual,
-        mes=mes_atual
+        mes=mes_atual,
+        dt_inicio_custom=d_inicio_window,
+        dt_fim_custom=d_fim_window
     )
 
-    # Períodos que interceptam o mês atual
-    dt_ini_mes_obj = date(ano_atual, mes_atual, 1)
-    dt_fim_mes_obj = date(ano_atual, mes_atual, dias_no_mes)
-    periodos_do_mes = [
+    # Períodos que interceptam a janela contínua
+    periodos_da_janela = [
         p for p in todos_periodos
-        if not (p["fim"] < dt_ini_mes_obj or p["inicio"] > dt_fim_mes_obj)
+        if not (p["fim"] < d_inicio_window or p["inicio"] > d_fim_window)
     ]
 
-    # --- CARDS DE KPIS DO MÊS ---
+    # --- CARDS DE KPIS DA JANELA ---
     hoje_str = hoje.strftime("%Y-%m-%d")
-    total_linhas = len(membros)
     embarcados_hoje = sum(1 for m in membros if escalas_map.get((m["nome"], hoje_str)) in ("EMB", "E"))
-    total_dias_emb_mes = sum(1 for st_val in escalas_map.values() if st_val in ("EMB", "E"))
-    total_dias_fol_mes = sum(1 for st_val in escalas_map.values() if st_val == "FOL")
-    total_conflitos_mes = len(lista_conflitos)
+    total_dias_emb_janela = sum(1 for st_val in escalas_map.values() if st_val in ("EMB", "E"))
+    total_dias_fol_janela = sum(1 for st_val in escalas_map.values() if st_val == "FOL")
+    total_conflitos_janela = len(lista_conflitos)
 
     k1, k2, k3, k4, k5, k6 = st.columns(6)
     k1.metric(f"Equipe Base {proj_norm}", qtd_nativos)
     k2.metric("Externos Escalados", qtd_externos)
     k3.metric("Embarcados Hoje", embarcados_hoje)
-    k4.metric("Dias Embarque (EMB)", total_dias_emb_mes)
-    k5.metric("Folga Projetada (FOL)", total_dias_fol_mes)
+    k4.metric("Dias EMB (6 Meses)", total_dias_emb_janela)
+    k5.metric("Folga Projetada (FOL)", total_dias_fol_janela)
     k6.metric(
-        "Conflitos no Mês",
-        total_conflitos_mes,
-        delta=f"{total_conflitos_mes} alerta(s)" if total_conflitos_mes > 0 else "Nenhum",
-        delta_color="inverse" if total_conflitos_mes > 0 else "normal"
+        "Conflitos Detectados",
+        total_conflitos_janela,
+        delta=f"{total_conflitos_janela} alerta(s)" if total_conflitos_janela > 0 else "Nenhum",
+        delta_color="inverse" if total_conflitos_janela > 0 else "normal"
     )
 
     if lista_conflitos:
-        with st.expander(f"⚠️ Atenção: {total_conflitos_mes} Conflito(s) Detectado(s) com o Cronograma", expanded=False):
+        with st.expander(f"⚠️ Atenção: {total_conflitos_janela} Conflito(s) Detectado(s) com o Cronograma na Janela de 6 Meses", expanded=False):
             st.dataframe(pd.DataFrame(lista_conflitos), use_container_width=True, hide_index=True)
-
 
     # --- PAINEL DO EDITOR ---
     todos_cadastrados = EscalaP80DB.get_todos_membros(apenas_ativos=True)
@@ -3007,20 +3495,23 @@ def render_aba_escala_projeto(
                         disc_ext_livre = st.selectbox("Disciplina:", DISCIPLINAS_PADRAO, key=f"{pfx}_disc_ext_livre")
                         sel_nome = nome_ext_livre.strip().upper()
                         sel_disc = disc_ext_livre
+                        sel_regime_padrao = "14x21"
                         is_externo_novo = True
                     else:
                         membro_obj = nomes_map[sel_rotulo]
                         sel_nome = membro_obj["nome"]
                         sel_disc = membro_obj["disciplina"]
                         sel_proj_orig = membro_obj.get("projeto", "Outro")
+                        sel_regime_padrao = membro_obj.get("regime_folga", "14x21")
                         extra_info = " (Membro Externo)" if sel_proj_orig != proj_norm else " (Equipe Base)"
-                        st.caption(f"Disciplina: **{sel_disc}** | Origem: **{sel_proj_orig}**{extra_info}")
+                        st.caption(f"Disciplina: **{sel_disc}** | Regime Base: **{sel_regime_padrao}** | Origem: **{sel_proj_orig}**{extra_info}")
                         is_externo_novo = False
 
                 with col_p2:
+                    status_disponiveis = list(STATUS_MAP.keys())
                     sel_status = st.selectbox(
                         "Condição / Status",
-                        list(STATUS_MAP.keys()),
+                        status_disponiveis,
                         format_func=lambda s: f"{s} - {STATUS_MAP[s]['nome']}" if s != STATUS_MAP[s]['nome'] else s,
                         key=f"{pfx}_form_status"
                     )
@@ -3028,17 +3519,26 @@ def render_aba_escala_projeto(
 
                 with col_p3:
                     dt_inicio_sugest = date(ano_atual, mes_atual, 1)
-                    dt_fim_sugest = date(ano_atual, mes_atual, min(14, dias_no_mes))
+                    dt_fim_sugest = date(ano_atual, mes_atual, min(14, calendar.monthrange(ano_atual, mes_atual)[1]))
                     p_inicio = st.date_input("Data Início", dt_inicio_sugest, key=f"{pfx}_form_dt_ini")
                     p_fim = st.date_input("Data Término", dt_fim_sugest, key=f"{pfx}_form_dt_fim")
 
                 if sel_status in ("EMB", "E"):
+                    c_reg1, c_reg2 = st.columns(2)
+                    with c_reg1:
+                        sel_regime = st.selectbox(
+                            "Regime de Folga do Embarque:",
+                            ["14x21", "14x14"],
+                            index=0 if sel_regime_padrao == "14x21" else 1,
+                            key=f"{pfx}_form_regime",
+                            help="14x21 gera 1,5x dias de folga; 14x14 gera 1,0x dias de folga."
+                        )
                     dias_est = (p_fim - p_inicio).days + 1 if p_fim >= p_inicio else 1
-                    folgas_proj = math.ceil(dias_est * 1.5)
-                    st.info(f"⚓ **Regra Automática:** O embarque (EMB) de {dias_est} dias em **{proj_norm}** gerará automaticamente **{folgas_proj} dias de folga ('FOL')** projetados na sequência (1,5x arredondado para cima).")
+                    folgas_proj = dias_est if sel_regime == "14x14" else math.ceil(dias_est * 1.5)
+                    st.info(f"⚓ **Regra {sel_regime}:** O embarque (EMB) de {dias_est} dias gerará automaticamente **{folgas_proj} dias de folga ('FOL')** projetados na sequência.")
 
-                    alocar_escala_14x21 = st.checkbox("Alocar em escala cíclica (regime 14x21)", key=f"{pfx}_chk_escala_14x21")
-                    if alocar_escala_14x21:
+                    alocar_escala_ciclica = st.checkbox(f"Alocar em escala cíclica contínua (regime {sel_regime})", key=f"{pfx}_chk_escala_ciclica")
+                    if alocar_escala_ciclica:
                         qtd_embarques_proj = st.number_input(
                             "Quantidade de embarques completos a projetar:",
                             min_value=1,
@@ -3047,10 +3547,18 @@ def render_aba_escala_projeto(
                             step=1,
                             key=f"{pfx}_qtd_embarques_proj"
                         )
-                        dias_tot = int(qtd_embarques_proj) * 35
-                        st.success(f"Serão gerados **{qtd_embarques_proj} períodos consecutivos** de 14 dias de embarque (EMB) e 21 dias de folga (FOL) a partir de **{p_inicio:%d/%m/%Y}** (cobertura total de {dias_tot} dias).")
+                        dias_ciclo = 28 if sel_regime == "14x14" else 35
+                        dias_tot = int(qtd_embarques_proj) * dias_ciclo
+                        folga_c = 14 if sel_regime == "14x14" else 21
+                        st.success(f"Serão gerados **{qtd_embarques_proj} ciclos consecutivos** de 14 dias de embarque e {folga_c} dias de folga a partir de **{p_inicio:%d/%m/%Y}** (cobertura total de {dias_tot} dias).")
+                elif sel_status == "LIC":
+                    sel_regime = sel_regime_padrao
+                    alocar_escala_ciclica = False
+                    qtd_embarques_proj = 1
+                    st.info("🏥 **Licença:** Ocupa o período selecionado sem gerar projeção de folga.")
                 else:
-                    alocar_escala_14x21 = False
+                    sel_regime = sel_regime_padrao
+                    alocar_escala_ciclica = False
                     qtd_embarques_proj = 1
 
                 if st.button(f"💾 Salvar Escala na {proj_norm}", type="primary", key=f"{pfx}_btn_salvar_periodo"):
@@ -3060,16 +3568,19 @@ def render_aba_escala_projeto(
                         if is_externo_novo:
                             EscalaP80DB.add_membro(sel_nome, sel_disc, funcao="Externo", projeto="EXTERNO")
 
-                        if alocar_escala_14x21 and sel_status in ("EMB", "E"):
-                            dias_s, dias_f = EscalaP80DB.salvar_escala_ciclica_14x21(
+                        EscalaP80DB.set_regime_colaborador(sel_nome, sel_regime)
+
+                        if alocar_escala_ciclica and sel_status in ("EMB", "E"):
+                            dias_s, dias_f = EscalaP80DB.salvar_escala_ciclica(
                                 nome=sel_nome,
                                 disciplina=sel_disc,
                                 projeto=proj_norm,
                                 d_inicio=p_inicio,
                                 qtd_ciclos=int(qtd_embarques_proj),
-                                observacao=obs_texto
+                                observacao=obs_texto,
+                                regime=sel_regime
                             )
-                            st.success(f"Escala contínua 14x21 gravada com sucesso em {proj_norm}: {qtd_embarques_proj} embarques ({dias_s} dias EMB) e {dias_f} dias de folga (FOL)!")
+                            st.success(f"Escala contínua {sel_regime} gravada com sucesso em {proj_norm}: {qtd_embarques_proj} embarques ({dias_s} dias EMB) e {dias_f} dias de folga (FOL)!")
                         else:
                             dias_s, dias_f = EscalaP80DB.salvar_escala_periodo(
                                 nome=sel_nome,
@@ -3078,23 +3589,24 @@ def render_aba_escala_projeto(
                                 d_inicio=p_inicio,
                                 d_fim=p_fim,
                                 status=sel_status,
-                                observacao=obs_texto
+                                observacao=obs_texto,
+                                regime_folga=sel_regime
                             )
                             msg = f"Escala gravada com sucesso em {proj_norm}: {dias_s} dias de '{sel_status}'."
                             if dias_f > 0:
-                                msg += f" Projeção automática gerada: {dias_f} dias de folga ('FOL')."
+                                msg += f" Projeção automática gerada ({sel_regime}): {dias_f} dias de folga ('FOL')."
                             st.success(msg)
                         st.rerun()
 
-            # 2. Editar Períodos Existentes (Substitui Ajustar Célula Pontual)
+            # 2. Editar Períodos Existentes
             with tab_edit_per:
                 st.markdown(f"##### Editar Período Programado em **{proj_norm}**")
-                if not periodos_do_mes:
-                    st.info(f"Não há períodos programados cadastrados em {proj_norm} para {MESES_PT[mes_atual-1]}/{ano_atual}.")
+                if not periodos_da_janela:
+                    st.info(f"Não há períodos programados cadastrados em {proj_norm} para a janela de 6 meses.")
                 else:
                     opcoes_periodos = [
                         f"{p['nome']} | {p['inicio']:%d/%m/%Y} a {p['fim']:%d/%m/%Y} — {p['status']} ({p['dias']}d)"
-                        for p in periodos_do_mes
+                        for p in periodos_da_janela
                     ]
                     sel_per_str = st.selectbox(
                         "Selecione o período que deseja editar ou excluir:",
@@ -3102,7 +3614,7 @@ def render_aba_escala_projeto(
                         key=f"{pfx}_sel_per_edit"
                     )
                     idx_p = opcoes_periodos.index(sel_per_str)
-                    p_selecionado = periodos_do_mes[idx_p]
+                    p_selecionado = periodos_da_janela[idx_p]
 
                     c_pe1, c_pe2, c_pe3 = st.columns(3)
                     with c_pe1:
@@ -3122,6 +3634,7 @@ def render_aba_escala_projeto(
                     c_act1, c_act2 = st.columns(2)
                     with c_act1:
                         if st.button("💾 Salvar Alterações deste Período", type="primary", key=f"{pfx}_btn_upd_per", use_container_width=True):
+                            reg_colab_ed = EscalaP80DB.get_regime_colaborador(p_selecionado["nome"])
                             EscalaP80DB.atualizar_periodo(
                                 nome=p_selecionado["nome"],
                                 disciplina=p_selecionado["disciplina"],
@@ -3130,7 +3643,8 @@ def render_aba_escala_projeto(
                                 d_fim_antigo=p_selecionado["fim"],
                                 d_ini_novo=novo_p_ini,
                                 d_fim_novo=novo_p_fim,
-                                status_novo=novo_p_st
+                                status_novo=novo_p_st,
+                                regime_folga=reg_colab_ed
                             )
                             st.success("Período atualizado com sucesso!")
                             st.rerun()
@@ -3149,7 +3663,7 @@ def render_aba_escala_projeto(
             # 3. Gerenciar Membros
             with tab_membros:
                 st.markdown(f"##### Cadastrar Novo Profissional na Equipe **{proj_norm}**")
-                cm1, cm2, cm3, cm4 = st.columns([3, 2, 2, 2])
+                cm1, cm2, cm3, cm4, cm5 = st.columns([3, 2, 2, 2, 2])
                 with cm1:
                     novo_nome = st.text_input("Nome do Colaborador", key=f"{pfx}_novo_nome")
                 with cm2:
@@ -3157,12 +3671,15 @@ def render_aba_escala_projeto(
                 with cm3:
                     nova_func = st.text_input("Função (opcional)", value="Técnico", key=f"{pfx}_nova_func")
                 with cm4:
+                    novo_reg = st.selectbox("Regime Padrão", ["14x21", "14x14"], index=0, key=f"{pfx}_novo_regime")
+                with cm5:
                     st.write("")
                     st.write("")
-                    if st.button("➕ Adicionar à Equipe", key=f"{pfx}_btn_add_membro"):
+                    if st.button("➕ Cadastrar", key=f"{pfx}_btn_add_membro"):
                         if novo_nome:
                             EscalaP80DB.add_membro(novo_nome, nova_disc, nova_func, proj_norm)
-                            st.success(f"{novo_nome} adicionado à equipe {proj_norm}!")
+                            EscalaP80DB.set_regime_colaborador(novo_nome, novo_reg)
+                            st.success(f"{novo_nome} adicionado à equipe {proj_norm} ({novo_reg})!")
                             st.rerun()
                         else:
                             st.error("Informe o nome.")
@@ -3182,12 +3699,12 @@ def render_aba_escala_projeto(
                             st.warning(f"{membro_remover} desativado.")
                             st.rerun()
 
-            # 4. Limpar Escalas (Ajustado e Confiável)
+            # 4. Limpar Escalas
             with tab_limpar:
                 st.markdown(f"##### Limpeza de Escalas em **{proj_norm}**")
                 tipo_limpeza = st.radio(
                     "O que você deseja limpar?",
-                    ["Por Colaborador Específico", f"TODAS as escalas deste mês ({MESES_PT[mes_atual-1]}/{ano_atual})"],
+                    ["Por Colaborador Específico", f"TODAS as escalas deste mês inicial ({MESES_PT[mes_atual-1]}/{ano_atual})"],
                     key=f"{pfx}_radio_tipo_limpeza"
                 )
 
@@ -3201,7 +3718,7 @@ def render_aba_escala_projeto(
                             colab_sel = st.selectbox("Selecione o Colaborador:", nomes_limpar, key=f"{pfx}_colab_limpar_sel")
                         with c_cl2:
                             d_ini_limp = st.date_input("Data Início:", date(ano_atual, mes_atual, 1), key=f"{pfx}_dt_ini_limp")
-                            d_fim_limp = st.date_input("Data Fim:", date(ano_atual, mes_atual, dias_no_mes), key=f"{pfx}_dt_fim_limp")
+                            d_fim_limp = st.date_input("Data Fim:", date(ano_atual, mes_atual, calendar.monthrange(ano_atual, mes_atual)[1]), key=f"{pfx}_dt_fim_limp")
 
                         if st.button(f"🗑️ Limpar Escalas de {colab_sel}", key=f"{pfx}_btn_exec_limpar_colab", type="primary"):
                             qtd_rem = EscalaP80DB.limpar_escalas(
@@ -3214,20 +3731,21 @@ def render_aba_escala_projeto(
                             st.rerun()
 
                 else:
-                    st.warning(f"⚠️ Atenção: Esta ação removerá todas as escalas lançadas em **{proj_norm}** no período de **01/{mes_atual:02d}/{ano_atual} a {dias_no_mes:02d}/{mes_atual:02d}/{ano_atual}**.")
-                    confirma = st.checkbox("Confirmo que desejo apagar todas as escalas do mês nesta unidade", key=f"{pfx}_chk_confirma_total")
+                    _, dias_mes_ini = calendar.monthrange(ano_atual, mes_atual)
+                    st.warning(f"⚠️ Atenção: Esta ação removerá todas as escalas lançadas em **{proj_norm}** no período de **01/{mes_atual:02d}/{ano_atual} a {dias_mes_ini:02d}/{mes_atual:02d}/{ano_atual}**.")
+                    confirma = st.checkbox("Confirmo que desejo apagar todas as escalas do mês inicial nesta unidade", key=f"{pfx}_chk_confirma_total")
                     if st.button(f"🗑️ Limpar Todas as Escalas de {MESES_PT[mes_atual-1]}", key=f"{pfx}_btn_exec_limpar_total", disabled=not confirma, type="primary"):
                         qtd_rem = EscalaP80DB.limpar_escalas(
                             projeto=proj_norm,
-                            d_inicio=d_inicio_mes,
-                            d_fim=d_fim_mes,
+                            d_inicio=f"{ano_atual:04d}-{mes_atual:02d}-01",
+                            d_fim=f"{ano_atual:04d}-{mes_atual:02d}-{dias_mes_ini:02d}",
                             nome="TODOS"
                         )
                         st.success(f"Todas as escalas do mês foram limpas! ({qtd_rem} registros apagados).")
                         st.rerun()
 
-    # --- GRADE VISUAL MATRICIAL (RENDERIZADA VIA IFRAME COM CSS INTEGRAL) ---
-    st.subheader(f"📅 Escala Mensal {proj_norm} — {MESES_PT[mes_atual-1]} de {ano_atual}")
+    # --- GRADE VISUAL MATRICIAL DE 6 MESES (RENDERIZADA VIA IFRAME) ---
+    st.subheader(f"📅 Escala {proj_norm} — Janela Contínua de 6 Meses ({meses_info[0]['nome']}/{meses_info[0]['ano']} a {meses_info[-1]['nome']}/{meses_info[-1]['ano']})")
     html_page = build_scala_html(
         projeto=proj_norm,
         ano=ano_atual,
@@ -3238,10 +3756,13 @@ def render_aba_escala_projeto(
         qtd_nativos=qtd_nativos,
         qtd_externos=qtd_externos,
         is_editor=is_editor,
-        filtro_busca=filtro_pesquisa
+        filtro_busca=filtro_pesquisa,
+        meses_info=meses_info,
+        lista_dias=lista_dias,
+        config_vagas=config_vagas
     )
 
-    altura_iframe = min(850, max(500, len(membros) * 36 + 140))
+    altura_iframe = min(880, max(520, len(membros) * 36 + 180))
     components.html(html_page, height=altura_iframe, scrolling=True)
 
 
