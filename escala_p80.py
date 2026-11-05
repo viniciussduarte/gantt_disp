@@ -1604,7 +1604,7 @@ def build_scala_html(
             grupos[disc].append(m)
 
     total_dias = len(lista_dias)
-    col_width_dia = 28
+    col_width_dia = 37
     col_width_nome = 200
     total_grid_min_width = col_width_nome + (total_dias * col_width_dia)
 
@@ -1733,7 +1733,7 @@ def build_scala_html(
             box-shadow: 0 1px 2px rgba(0,0,0,0.12);
             font-weight: bold;
             font-size: 10px;
-            letter-spacing: 0.2px;
+            letter-spacing: 0px;
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
