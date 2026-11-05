@@ -11,6 +11,13 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
+from escala_p80 import (
+    render_aba_escala_projeto,
+    render_aba_sugestoes,
+    render_aba_log_edicoes,
+    normalizar_projeto,
+)
+
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 
 
@@ -250,6 +257,51 @@ class DataLoader:
             st.error(f"Erro ao carregar o Planejamento Geral: {e}")
             return None
 
+    @staticmethod
+    def load_escalas_plataformas_data(equipe_df: Optional[pd.DataFrame] = None) -> Optional[pd.DataFrame]:
+        try:
+            from escala_p80 import EscalaP80DB
+            periodos, _ = EscalaP80DB.get_periodos_agrupados("TODOS")
+            if not periodos:
+                return pd.DataFrame(columns=["Nome", "Matrícula", "Início", "Término", "Tipo", "Plataforma", "Detalhamento"])
+
+            tipo_map = {
+                "EMB": "Embarque",
+                "E": "Embarque",
+                "FOL": "Folga",
+                "FÉR": "Férias",
+                "FÉRIAS": "Férias",
+                "BASE": "Estaleiro",
+                "TREIN": "Treinamento",
+                "TREINAMENTO": "Treinamento",
+                "PMB": "Treinamento",
+            }
+
+            rows = []
+            for p in periodos:
+                st_tipo = tipo_map.get(p["status"], "Embarque")
+                rows.append({
+                    "Nome": p["nome"],
+                    "Início": pd.Timestamp(p["inicio"]),
+                    "Término": pd.Timestamp(p["fim"]),
+                    "Tipo": st_tipo,
+                    "Plataforma": p.get("projeto", "P-80"),
+                    "Detalhamento": f"Escala {p.get('projeto', 'P-80')}",
+                })
+
+            df = pd.DataFrame(rows)
+            if equipe_df is not None and not equipe_df.empty:
+                df = df.merge(
+                    equipe_df[["Nome", "Matrícula"]].drop_duplicates(subset=["Nome"]),
+                    on="Nome",
+                    how="left"
+                )
+            else:
+                df["Matrícula"] = pd.NA
+            return df
+        except Exception:
+            return None
+
 
 # --- PROCESSAMENTO ----------------------------------------------------------
 class DataProcessor:
@@ -362,17 +414,37 @@ class DataProcessor:
                 for j in range(i + 1, len(values)):
                     b = values[j]
                     if a["Início"] <= b["Término"] and b["Início"] <= a["Término"]:
-                        overlap = min(a["Término"], b["Término"]) - max(a["Início"], b["Início"])
+                        overlap_start = max(a["Início"], b["Início"])
+                        overlap_end = min(a["Término"], b["Término"])
+                        overlap = overlap_end - overlap_start
                         overlap_days = overlap.days + 1
+
+                        proj_val = None
+                        for item in (a, b):
+                            for col_name in ("Projeto", "Plataforma"):
+                                v = item.get(col_name)
+                                if pd.notna(v) and str(v).strip() != "" and str(v).strip().lower() != "nan":
+                                    proj_val = str(v).strip()
+                                    break
+                            if proj_val:
+                                break
+                        proj_norm = normalizar_projeto(proj_val) if proj_val else "P-80"
+
                         rows.append({
                             "Nome": a["Nome"],
                             "Matrícula": mat,
+                            "Projeto": proj_norm,
                             "Atividade A": a["Tipo"],
                             "Período A": f"{a['Início']:%d/%m/%Y} – {a['Término']:%d/%m/%Y}",
                             "Início A": a["Início"],
+                            "Término A": a["Término"],
                             "Atividade B": b["Tipo"],
                             "Período B": f"{b['Início']:%d/%m/%Y} – {b['Término']:%d/%m/%Y}",
                             "Início B": b["Início"],
+                            "Término B": b["Término"],
+                            "Início Conflito": overlap_start,
+                            "Término Conflito": overlap_end,
+                            "Período Conflito": f"{overlap_start:%d/%m/%Y} – {overlap_end:%d/%m/%Y}",
                             "Sobreposição (dias)": overlap_days,
                         })
                         keys.add((int(mat), a["Início"], a["Tipo"]))
@@ -380,14 +452,12 @@ class DataProcessor:
                     elif b["Início"] > a["Término"]:
                         break
 
-        conflicts = pd.DataFrame(
-            rows,
-            columns=[
-                "Nome", "Matrícula", "Atividade A", "Período A", "Início A",
-                "Atividade B", "Período B", "Início B", "Sobreposição (dias)",
-            ],
-        )
-        display_cols = ["Nome", "Atividade A", "Período A", "Atividade B", "Período B", "Sobreposição (dias)"]
+        cols = [
+            "Nome", "Matrícula", "Projeto", "Atividade A", "Período A", "Início A", "Término A",
+            "Atividade B", "Período B", "Início B", "Término B",
+            "Início Conflito", "Término Conflito", "Período Conflito", "Sobreposição (dias)",
+        ]
+        conflicts = pd.DataFrame(rows, columns=cols)
         return conflicts, keys
 
 
@@ -421,8 +491,8 @@ class Visualizer:
                 g = g.sort_values("Nome")
                 starts = g["Início"]
                 ends = g["Término"]
-                start_ms = (starts.astype("int64") // 1_000_000).astype("int64")
-                end_ms = ((ends + pd.Timedelta(days=1)).astype("int64") // 1_000_000).astype("int64")
+                start_ms = starts.astype("datetime64[ms]").astype("int64")
+                end_ms = (ends + pd.Timedelta(days=1)).astype("datetime64[ms]").astype("int64")
                 x_ms = (end_ms - start_ms)
                 dias = (ends - starts).dt.days + 1
 
@@ -460,8 +530,8 @@ class Visualizer:
             if not chart_df_conf.empty:
                 starts_c = chart_df_conf["Início"]
                 ends_c = chart_df_conf["Término"]
-                start_ms_c = (starts_c.astype("int64") // 1_000_000).astype("int64")
-                end_ms_c = ((ends_c + pd.Timedelta(days=1)).astype("int64") // 1_000_000).astype("int64")
+                start_ms_c = starts_c.astype("datetime64[ms]").astype("int64")
+                end_ms_c = (ends_c + pd.Timedelta(days=1)).astype("datetime64[ms]").astype("int64")
                 x_ms_c = (end_ms_c - start_ms_c)
                 custom_conf = []
                 for _, r in chart_df_conf.iterrows():
@@ -608,15 +678,15 @@ class App:
     def __init__(self):
         st.set_page_config(
             layout="wide",
-            page_title="Gestão de Alocação",
+            page_title="Gestão de Alocação & Escalas v0.1",
             page_icon="📊",
             initial_sidebar_state="expanded",
         )
         self.hoje = datetime.today().date()
 
     def run(self):
-        st.title("Painel de Disponibilidade de Equipe")
-        st.caption("Visualização integrada de Estaleiro, Férias e Planejamento Geral.")
+        st.title("🚢 Painel de Disponibilidade e Escalas de Plataforma — v0.1")
+        st.caption("Visualização integrada de Estaleiro, Férias, Planejamento Geral e Escalas P-80, P-82 e P-83 (v0.1).")
 
         with st.sidebar:
             st.header("Filtros")
@@ -628,6 +698,7 @@ class App:
             _, plan_df = DataLoader.load_estaleiro_data()
             ferias_df = DataLoader.load_ferias_data()
             geral_df = DataLoader.load_planejamento_geral()
+            plataformas_df = DataLoader.load_escalas_plataformas_data(equipe_df)
 
             if equipe_df is None:
                 st.error("Falha ao carregar a aba Equipe do Planejamento Geral.")
@@ -676,14 +747,29 @@ class App:
             return
 
         combined_df, unique_members = DataProcessor.prepare_combined_data(
-            equipe_filtered, [plan_df, ferias_df, geral_df]
+            equipe_filtered, [plan_df, ferias_df, geral_df, plataformas_df]
         )
 
         occupied_ids = DataProcessor.occupied_in_period(combined_df, d_inicio, d_fim)
         familiar_available = DataProcessor.available_in_period(unique_members, combined_df, d_inicio, d_fim)
         events_in_window = DataProcessor.events_in_period(combined_df, d_inicio, d_fim)
         conflicts_full, conflict_keys = DataProcessor.detect_conflicts(combined_df)
-        conflicts_df = conflicts_full[["Nome", "Atividade A", "Período A", "Atividade B", "Período B", "Sobreposição (dias)"]] if not conflicts_full.empty else conflicts_full
+        hoje_ts = pd.Timestamp(self.hoje)
+        # Filtra apenas conflitos futuros (onde o término da sobreposição é estritamente posterior ao dia atual)
+        if not conflicts_full.empty and "Término Conflito" in conflicts_full.columns:
+            conflicts_futuros = conflicts_full[conflicts_full["Término Conflito"] > hoje_ts].copy().reset_index(drop=True)
+        else:
+            conflicts_futuros = pd.DataFrame(columns=conflicts_full.columns)
+
+        display_cols = [
+            "Nome", "Projeto", "Atividade A", "Período A", "Atividade B", "Período B",
+            "Período Conflito", "Sobreposição (dias)"
+        ]
+        conflicts_df = (
+            conflicts_futuros[[c for c in display_cols if c in conflicts_futuros.columns]].copy()
+            if not conflicts_futuros.empty
+            else pd.DataFrame(columns=display_cols)
+        )
 
         conflict_details = {}
         if not conflicts_full.empty:
@@ -703,7 +789,7 @@ class App:
         k2.metric("Disponíveis", n_available)
         k3.metric("Ocupados no período", n_occupied)
         k4.metric("Eventos no período", len(events_in_window))
-        k5.metric("Conflitos", len(conflicts_df))
+        k5.metric("Conflitos (Futuros)", len(conflicts_df), help="Apenas conflitos futuros com término posterior a hoje")
 
         display_members = unique_members.copy()
         if only_available:
@@ -711,36 +797,117 @@ class App:
                 display_members["Matrícula"].astype(str).isin(familiar_available)
             ].reset_index(drop=True)
 
-        if display_members.empty:
-            st.info("Nenhum colaborador disponível para os critérios selecionados.")
-            return
-
-        chart_df = combined_df[combined_df["Matrícula"].isin(set(display_members["Matrícula"]))].copy()
+        chart_df = combined_df[combined_df["Matrícula"].isin(set(display_members["Matrícula"]))].copy() if not display_members.empty else pd.DataFrame()
         chart_df = DataProcessor.events_in_period(chart_df, d_inicio, d_fim) if not chart_df.empty else chart_df
 
-        tab_crono, tab_conf, tab_equipe, tab_export = st.tabs(
-            ["Cronograma", "Conflitos", "Equipe", "Exportar"]
-        )
+        tab_names = [
+            "Cronograma",
+            "Escala P-80",
+            "Escala P-82",
+            "Escala P-83",
+            "Conflitos",
+            "Sugestões",
+            "Log de Edições",
+            "Equipe",
+            "Exportar",
+        ]
+        # Preserva aba selecionada caso informada via query_param ou session state
+        req_tab = st.query_params.get("tab") or st.session_state.get("active_main_tab")
+        if req_tab in tab_names:
+            tab_crono, tab_p80, tab_p82, tab_p83, tab_conf, tab_sugest, tab_log, tab_equipe, tab_export = st.tabs(
+                tab_names,
+                default=req_tab
+            )
+        else:
+            tab_crono, tab_p80, tab_p82, tab_p83, tab_conf, tab_sugest, tab_log, tab_equipe, tab_export = st.tabs(
+                tab_names
+            )
 
         with tab_crono:
-            y_ticktext = []
-            for _, row in display_members.iterrows():
-                nome = str(row["Nome"])
-                mat_str = str(int(row["Matrícula"])) if pd.notna(row["Matrícula"]) else None
-                if mat_str is not None and mat_str in familiar_available:
-                    y_ticktext.append(f'<span style="color:#10B981;font-weight:bold">{nome}</span>')
-                else:
-                    y_ticktext.append(f'<span style="color:#EF4444;font-weight:bold">{nome}</span>')
-            fig = Visualizer.create_gantt_chart(chart_df, display_members, d_inicio, d_fim, conflict_keys, conflict_details, y_ticktext)
-            st.plotly_chart(fig, use_container_width=True)
-            st.caption("Verde = disponível no período | Vermelho = ocupado | Barras vermelhas sobrepostas indicam conflitos.")
+            if display_members.empty:
+                st.info("Nenhum colaborador disponível para os critérios selecionados.")
+            else:
+                y_ticktext = []
+                for _, row in display_members.iterrows():
+                    nome = str(row["Nome"])
+                    mat_str = str(int(row["Matrícula"])) if pd.notna(row["Matrícula"]) else None
+                    if mat_str is not None and mat_str in familiar_available:
+                        y_ticktext.append(f'<span style="color:#10B981;font-weight:bold">{nome}</span>')
+                    else:
+                        y_ticktext.append(f'<span style="color:#EF4444;font-weight:bold">{nome}</span>')
+                fig = Visualizer.create_gantt_chart(chart_df, display_members, d_inicio, d_fim, conflict_keys, conflict_details, y_ticktext)
+                st.plotly_chart(fig, use_container_width=True)
+                st.caption("Verde = disponível no período | Vermelho = ocupado | Barras vermelhas sobrepostas indicam conflitos.")
+
+        with tab_p80:
+            render_aba_escala_projeto("P-80", equipe_geral_df=equipe_df, cronograma_df=combined_df)
+
+        with tab_p82:
+            render_aba_escala_projeto("P-82", equipe_geral_df=equipe_df, cronograma_df=combined_df)
+
+        with tab_p83:
+            render_aba_escala_projeto("P-83", equipe_geral_df=equipe_df, cronograma_df=combined_df)
 
         with tab_conf:
+            st.subheader("Relatório de Conflitos Futuros")
+            st.caption(f"Mostrando e mensurando apenas conflitos com data fim maior que o dia atual ({self.hoje:%d/%m/%Y}).")
+
             if conflicts_df.empty:
-                st.success("✅ Nenhum conflito de agendamento detectado.")
+                st.success("✅ Nenhum conflito futuro de agendamento detectado.")
             else:
-                st.warning(f"⚠️ {len(conflicts_df)} conflito(s) encontrado(s).")
-                st.dataframe(conflicts_df, use_container_width=True, hide_index=True)
+                df_p80 = conflicts_df[conflicts_df["Projeto"] == "P-80"].reset_index(drop=True)
+                df_p82 = conflicts_df[conflicts_df["Projeto"] == "P-82"].reset_index(drop=True)
+                df_p83 = conflicts_df[conflicts_df["Projeto"] == "P-83"].reset_index(drop=True)
+                df_outros = conflicts_df[~conflicts_df["Projeto"].isin(["P-80", "P-82", "P-83"])].reset_index(drop=True)
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("P-80", f"{len(df_p80)} conflito(s)")
+                c2.metric("P-82", f"{len(df_p82)} conflito(s)")
+                c3.metric("P-83", f"{len(df_p83)} conflito(s)")
+
+                st.markdown("---")
+
+                tab_labels = [f"P-80 ({len(df_p80)})", f"P-82 ({len(df_p82)})", f"P-83 ({len(df_p83)})"]
+                if not df_outros.empty:
+                    tab_labels.append(f"Outros ({len(df_outros)})")
+
+                subtabs = st.tabs(tab_labels)
+                cols_sub = [
+                    c for c in ["Nome", "Atividade A", "Período A", "Atividade B", "Período B", "Período Conflito", "Sobreposição (dias)"]
+                    if c in conflicts_df.columns
+                ]
+
+                with subtabs[0]:
+                    if df_p80.empty:
+                        st.info("Nenhum conflito futuro detectado para P-80.")
+                    else:
+                        st.warning(f"⚠️ {len(df_p80)} conflito(s) futuro(s) encontrado(s) para P-80.")
+                        st.dataframe(df_p80[cols_sub], use_container_width=True, hide_index=True)
+
+                with subtabs[1]:
+                    if df_p82.empty:
+                        st.info("Nenhum conflito futuro detectado para P-82.")
+                    else:
+                        st.warning(f"⚠️ {len(df_p82)} conflito(s) futuro(s) encontrado(s) para P-82.")
+                        st.dataframe(df_p82[cols_sub], use_container_width=True, hide_index=True)
+
+                with subtabs[2]:
+                    if df_p83.empty:
+                        st.info("Nenhum conflito futuro detectado para P-83.")
+                    else:
+                        st.warning(f"⚠️ {len(df_p83)} conflito(s) futuro(s) encontrado(s) para P-83.")
+                        st.dataframe(df_p83[cols_sub], use_container_width=True, hide_index=True)
+
+                if not df_outros.empty:
+                    with subtabs[3]:
+                        st.warning(f"⚠️ {len(df_outros)} conflito(s) futuro(s) em outras bases.")
+                        st.dataframe(df_outros[cols_sub], use_container_width=True, hide_index=True)
+
+        with tab_sugest:
+            render_aba_sugestoes()
+
+        with tab_log:
+            render_aba_log_edicoes()
 
         with tab_equipe:
             status_rows = display_members.copy()
@@ -754,13 +921,16 @@ class App:
 
         with tab_export:
             st.subheader("Eventos no período")
-            st.dataframe(events_in_window, use_container_width=True, hide_index=True) if not events_in_window.empty else st.info("Sem eventos no período.")
+            if not events_in_window.empty:
+                st.dataframe(events_in_window, use_container_width=True, hide_index=True)
+            else:
+                st.info("Sem eventos no período.")
             st.divider()
             c_exp1, c_exp2, c_exp3 = st.columns(3)
             if not events_in_window.empty:
                 c_exp1.download_button("📥 Eventos (CSV)", events_in_window.to_csv(index=False).encode("utf-8"), "eventos.csv", "text/csv", use_container_width=True)
             if not conflicts_df.empty:
-                c_exp2.download_button("📥 Conflitos (CSV)", conflicts_df.to_csv(index=False).encode("utf-8"), "conflitos.csv", "text/csv", use_container_width=True)
+                c_exp2.download_button("📥 Conflitos Futuros (CSV)", conflicts_df.to_csv(index=False).encode("utf-8"), "conflitos_futuros.csv", "text/csv", use_container_width=True)
             equipe_csv = equipe_filtered.to_csv(index=False).encode("utf-8")
             c_exp3.download_button("📥 Equipe (CSV)", equipe_csv, "equipe.csv", "text/csv", use_container_width=True)
 
