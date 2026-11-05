@@ -2103,8 +2103,8 @@ def build_scala_html(
                 f'<div class="cell label"><span>{nome}</span><small style="color:#64748b;font-weight:normal;font-size:9px;">{disc}{reg_badge}</small>{badge_origem}</div>'
             )
 
-            nome_js = nome.replace("'", "\'")
-            disc_js = disc.replace("'", "\'")
+            nome_js = nome.replace("'", "\\'").replace('"', '&quot;')
+            disc_js = disc.replace("'", "\\'").replace('"', '&quot;')
 
             for idx_dia, dt in enumerate(lista_dias):
                 iso_dt = dt.strftime("%Y-%m-%d")
@@ -2128,9 +2128,10 @@ def build_scala_html(
                         p_fim_f = periodo_obj["fim"].strftime("%d/%m/%Y") if periodo_obj else dt.strftime("%d/%m/%Y")
                         tooltip = f"Emprestado para {dest_proj} ({p_ini_f} a {p_fim_f}) — Clique para ver detalhes"
                         tooltip_esc = tooltip.replace('"', '&quot;')
+                        dest_proj_js = dest_proj.replace("'", "\\'").replace('"', '&quot;')
                         cell_content = f"""
                         <div class="item-compact item-clickable item-emp"
-                             onclick="abrirModalEmprestado('{nome_js}', '{dest_proj}', '{p_ini_f}', '{p_fim_f}')"
+                             onclick="abrirModalEmprestado('{nome_js}', '{dest_proj_js}', '{p_ini_f}', '{p_fim_f}')"
                              style="background:{st_info['bg']};color:{st_info['color']};"
                              title="{tooltip_esc}">
                             {st_info['codigo']}
@@ -2922,6 +2923,7 @@ def build_scala_html(
         }}
 
         var destProjGlobal = '';
+        var _navigatingEmp = false;
 
         function navegarParaPlataforma(destProj) {{
             if (!destProj) return;
@@ -2932,61 +2934,75 @@ def build_scala_html(
             else if (projUpper.indexOf('83') >= 0) projLimpo = 'P-83';
             var tabName = 'Escala ' + projLimpo;
 
-            // 1. Tenta criar e submeter formulário invisível no documento pai (método mais compatível e confiável no Streamlit)
+            var tabAtivada = false;
+
+            // MÉTODO 1 (MAIS DIRETO, RÁPIDO E CONFIÁVEL NO STREAMLIT):
+            // Aciona o clique no elemento da aba do Streamlit no documento pai (sem recarregar a página)
             try {{
-                var topDoc = window.parent.document;
-                var topWin = window.parent;
-                var baseUrl = (topWin.location.origin || window.location.origin) + (topWin.location.pathname || '/');
-
-                var topForm = topDoc.createElement('form');
-                topForm.method = 'GET';
-                topForm.action = baseUrl;
-                topForm.style.display = 'none';
-
-                var inp = topDoc.createElement('input');
-                inp.type = 'hidden';
-                inp.name = 'tab';
-                inp.value = tabName;
-                topForm.appendChild(inp);
-
-                topDoc.body.appendChild(topForm);
-                topForm.submit();
-                return;
-            }} catch(e1) {{
-                console.warn("Navegação via topForm falhou:", e1);
+                var topDoc = (window.parent && window.parent.document) ? window.parent.document : document;
+                if (topDoc) {{
+                    var tabSelectors = [
+                        '[data-testid="stTab"]',
+                        'button[role="tab"]',
+                        '[role="tab"]',
+                        '[data-baseweb="tab"]',
+                        '.stTabs [role="tab"]',
+                        'div[role="tablist"] button'
+                    ];
+                    var tabs = topDoc.querySelectorAll(tabSelectors.join(','));
+                    for (var i = 0; i < tabs.length; i++) {{
+                        var t = tabs[i];
+                        var txt = (t.innerText || t.textContent || '').trim().replace(/\\s+/g, ' ');
+                        var matchExato = (txt === tabName || txt.indexOf(tabName) >= 0);
+                        var matchSigla = (txt.indexOf(projLimpo) >= 0 && txt.toLowerCase().indexOf('escala') >= 0);
+                        if (matchExato || matchSigla) {{
+                            try {{ t.scrollIntoView({{ behavior: 'smooth', block: 'nearest' }}); }} catch(eScr) {{}}
+                            t.focus();
+                            t.click();
+                            try {{
+                                var clickEvt = new MouseEvent('click', {{
+                                    bubbles: true,
+                                    cancelable: true,
+                                    view: window.parent || window
+                                }});
+                                t.dispatchEvent(clickEvt);
+                            }} catch(eEvt) {{}}
+                            tabAtivada = true;
+                            break;
+                        }}
+                    }}
+                }}
+            }} catch(eDom) {{
+                console.warn("Navegação via clique DOM na aba falhou:", eDom);
             }}
 
-            // 2. Fallback via injeção de script executado no contexto do documento pai
+            // Atualiza a URL na barra de endereços do documento pai para persistência (sem reload)
             try {{
-                var topDoc = window.parent.document;
-                var topWin = window.parent;
-                var baseUrl = (topWin.location.origin || window.location.origin) + (topWin.location.pathname || '/');
-                var targetUrl = baseUrl + '?tab=' + encodeURIComponent(tabName);
+                var topWin = window.parent || window;
+                if (topWin && topWin.history && topWin.history.pushState) {{
+                    var curUrl = new URL(topWin.location.href);
+                    curUrl.searchParams.set('tab', tabName);
+                    topWin.history.pushState({{ tab: tabName }}, '', curUrl.toString());
+                }}
+            }} catch(eHist) {{}}
 
-                var scriptElem = topDoc.createElement('script');
-                scriptElem.textContent = "window.location.href = " + JSON.stringify(targetUrl) + ";";
-                topDoc.body.appendChild(scriptElem);
-                scriptElem.remove();
-                return;
-            }} catch(e2) {{
-                console.warn("Navegação via script injection falhou:", e2);
-            }}
+            // MÉTODO 2 (FALLBACK SE O CLIQUE DIRETO NA ABA NÃO ENCONTROU O ELEMENTO):
+            if (!tabAtivada) {{
+                try {{
+                    var topWin = window.parent || window;
+                    var baseUrl = (topWin.location.origin || window.location.origin) + (topWin.location.pathname || '/');
+                    topWin.location.href = baseUrl + '?tab=' + encodeURIComponent(tabName);
+                    return;
+                }} catch(eTopWin) {{
+                    console.warn("Fallback topWin.location falhou:", eTopWin);
+                }}
 
-            // 3. Fallback via topWin.location
-            try {{
-                var topWin = window.parent;
-                var baseUrl = (topWin.location.origin || window.location.origin) + (topWin.location.pathname || '/');
-                topWin.location.href = baseUrl + '?tab=' + encodeURIComponent(tabName);
-                return;
-            }} catch(e3) {{
-                console.warn("Navegação via topWin.location falhou:", e3);
-            }}
-
-            // 4. Fallback direto via top
-            try {{
-                window.top.location.href = (window.location.origin || '') + '/?tab=' + encodeURIComponent(tabName);
-            }} catch(e4) {{
-                console.error("Todas as opções de navegação falharam:", e4);
+                try {{
+                    window.top.location.href = (window.location.origin || '') + '/?tab=' + encodeURIComponent(tabName);
+                    return;
+                }} catch(eTop) {{
+                    console.error("Todas as tentativas de navegação falharam:", eTop);
+                }}
             }}
         }}
 
@@ -2997,25 +3013,50 @@ def build_scala_html(
             var elPeriodo = document.getElementById('emp_periodo');
             var elBtn = document.getElementById('emp_nav_btn');
             if (!overlay) return;
-            destProjGlobal = destProj;
-            if (elNome) elNome.innerText = nome;
-            if (elDest) elDest.innerText = destProj;
-            if (elPeriodo) elPeriodo.innerText = dtIni + ' a ' + dtFim;
+
+            destProjGlobal = destProj || '';
+
+            if (elNome) elNome.innerText = nome || '';
+            if (elDest) elDest.innerText = destProj || 'Outra Unidade';
+            if (elPeriodo) elPeriodo.innerText = (dtIni && dtFim) ? (dtIni + ' a ' + dtFim) : '';
             if (elBtn) {{
-                elBtn.innerText = 'Ir para a Escala da ' + destProj + ' ➔';
+                var labelDest = destProj || 'Unidade';
+                elBtn.setAttribute('data-dest', destProj || '');
+                elBtn.dataset.dest = destProj || '';
+                elBtn.innerText = 'Ir para a Escala da ' + labelDest + ' ➔';
             }}
             overlay.style.display = 'flex';
         }}
 
-        function executarNavegacaoEmp() {{
-            if (!destProjGlobal) return;
-            fecharModalEmp();
-            navegarParaPlataforma(destProjGlobal);
-        }}
-
         function fecharModalEmp() {{
             var overlay = document.getElementById('empModalOverlay');
-            if (overlay) overlay.style.display = 'none';
+            if (overlay) {{
+                overlay.style.display = 'none';
+            }}
+        }}
+
+        function executarNavegacaoEmp() {{
+            // 1. O modal DEVE fechar imediatamente ao clicar
+            fecharModalEmp();
+
+            if (_navigatingEmp) return;
+            _navigatingEmp = true;
+            setTimeout(function() {{ _navigatingEmp = false; }}, 800);
+
+            // 2. Recupera o destino de múltiplas fontes seguras
+            var dest = destProjGlobal;
+            if (!dest) {{
+                var btn = document.getElementById('emp_nav_btn');
+                if (btn) dest = btn.getAttribute('data-dest') || btn.dataset.dest || '';
+            }}
+            if (!dest) {{
+                var elDest = document.getElementById('emp_dest');
+                if (elDest) dest = (elDest.innerText || elDest.textContent || '').trim();
+            }}
+
+            if (dest) {{
+                navegarParaPlataforma(dest);
+            }}
         }}
 
         if (modalOverlay) {{
@@ -3028,6 +3069,14 @@ def build_scala_html(
         if (empOverlay) {{
             empOverlay.addEventListener('click', function(e) {{
                 if (e.target === empOverlay) fecharModalEmp();
+            }});
+        }}
+
+        var btnEmpNav = document.getElementById('emp_nav_btn');
+        if (btnEmpNav) {{
+            btnEmpNav.addEventListener('click', function(e) {{
+                e.preventDefault();
+                executarNavegacaoEmp();
             }});
         }}
 
