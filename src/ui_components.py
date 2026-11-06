@@ -268,3 +268,185 @@ def render_export_tab(
         "text/csv",
         use_container_width=True,
     )
+
+
+def render_rt_embarques_tab(combined_df: pd.DataFrame, hoje: date) -> None:
+    """
+    Renderiza o módulo de gestão de RT (Requisição de Transporte) para os embarques.
+    Exibe em ordem cronológica crescente os embarques a partir de hoje, com campo de edição
+    para inserir e atualizar o número da RT do colaborador.
+    """
+    st.subheader("🎫 Módulo de RT dos Embarques")
+    st.caption(f"Embarques programados com término a partir de hoje ({hoje:%d/%m/%Y}), ordenados cronologicamente.")
+
+    if combined_df.empty:
+        st.info("Nenhum evento registrado no cronograma.")
+        return
+
+    hoje_ts = pd.Timestamp(hoje)
+    mask_emb = (
+        (combined_df["Tipo"].astype(str).str.strip().str.title() == "Embarque")
+        & (combined_df["Término"] >= hoje_ts)
+    )
+    df_emb = combined_df[mask_emb].copy()
+
+    if df_emb.empty:
+        st.info("Nenhum embarque futuro ou ativo a partir de hoje.")
+        return
+
+    df_emb["Início"] = pd.to_datetime(df_emb["Início"])
+    df_emb["Término"] = pd.to_datetime(df_emb["Término"])
+
+    from .schemas import normalizar_projeto
+    def _res_plat(row):
+        for col in ("Plataforma", "Projeto"):
+            val = row.get(col)
+            if pd.notna(val) and str(val).strip() != "" and str(val).strip().lower() != "nan":
+                return normalizar_projeto(str(val).strip())
+        return "P-80"
+
+    df_emb["Plataforma_Normalizada"] = df_emb.apply(_res_plat, axis=1)
+    df_emb = df_emb.sort_values(by=["Início", "Plataforma_Normalizada", "Nome"]).reset_index(drop=True)
+
+    from escala_p80 import EscalaP80DB
+    rts_map = EscalaP80DB.get_embarque_rts()
+
+    def _get_rt(row):
+        key = (
+            row["Plataforma_Normalizada"],
+            str(row["Nome"]).strip().upper(),
+            row["Início"].strftime("%Y-%m-%d"),
+            row["Término"].strftime("%Y-%m-%d"),
+        )
+        return rts_map.get(key, "")
+
+    df_emb["Número da RT"] = df_emb.apply(_get_rt, axis=1)
+    df_emb["Período"] = df_emb.apply(
+        lambda r: f"{r['Início']:%d/%m/%Y} a {r['Término']:%d/%m/%Y}", axis=1
+    )
+    df_emb["Dias"] = (df_emb["Término"] - df_emb["Início"]).dt.days + 1
+
+    total_emb = len(df_emb)
+    com_rt = sum(1 for rt in df_emb["Número da RT"] if str(rt).strip())
+    sem_rt = total_emb - com_rt
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total de Embarques", total_emb)
+    c2.metric("RTs Preenchidas", com_rt)
+    c3.metric("RTs Pendentes", sem_rt, delta=f"-{sem_rt}" if sem_rt > 0 else "0", delta_color="inverse")
+
+    st.markdown("---")
+
+    st.markdown("##### ✍️ Inserir / Atualizar Número da RT")
+    c_sel, c_rt, c_btn = st.columns([4, 3, 2])
+    with c_sel:
+        opcoes = [
+            f"{r['Plataforma_Normalizada']} | {r['Nome']} ({r['Período']})"
+            for _, r in df_emb.iterrows()
+        ]
+        sel_emb = st.selectbox("Selecione o Embarque", opcoes, key="sel_rt_embarque")
+    idx_sel = opcoes.index(sel_emb)
+    row_sel = df_emb.iloc[idx_sel]
+    cur_rt_val = row_sel["Número da RT"]
+
+    with c_rt:
+        novo_num_rt = st.text_input(
+            "Número da RT",
+            value=cur_rt_val,
+            placeholder="Ex: RT-2026-0894",
+            key="input_num_rt"
+        )
+    with c_btn:
+        st.write("")
+        st.write("")
+        if st.button("💾 Salvar RT", key="btn_salvar_rt", use_container_width=True):
+            EscalaP80DB.salvar_embarque_rt(
+                projeto=row_sel["Plataforma_Normalizada"],
+                nome=row_sel["Nome"],
+                data_inicio=row_sel["Início"].strftime("%Y-%m-%d"),
+                data_fim=row_sel["Término"].strftime("%Y-%m-%d"),
+                numero_rt=novo_num_rt
+            )
+            st.success(f"RT '{novo_num_rt}' vinculada com sucesso para {row_sel['Nome']}!")
+            st.rerun()
+
+    st.markdown("##### 📋 Tabela de Embarques e RTs")
+    cols_display = ["Plataforma_Normalizada", "Nome", "Período", "Dias", "Número da RT", "Detalhamento"]
+    cols_rename = {
+        "Plataforma_Normalizada": "Plataforma"
+    }
+    df_show = df_emb[[c for c in cols_display if c in df_emb.columns]].rename(columns=cols_rename)
+    st.dataframe(df_show, use_container_width=True, hide_index=True)
+
+    st.download_button(
+        "📥 Exportar Lista de RTs (CSV)",
+        df_show.to_csv(index=False).encode("utf-8"),
+        "embarques_rts.csv",
+        "text/csv",
+        use_container_width=True
+    )
+
+
+def inject_sidebar_tab_sync() -> None:
+    """
+    Injeta um script leve no cliente para sincronizar a visibilidade da sidebar com a aba ativa:
+    - Ao selecionar uma aba de Escala ou RT, colapsa a barra lateral para maximizar a largura da grade.
+    - Ao selecionar o Gráfico de Gantt, expande a barra lateral para disponibilizar os filtros.
+    """
+    import streamlit.components.v1 as components
+    js_code = """
+    <script>
+    (function() {
+        var topDoc = (window.parent && window.parent.document) ? window.parent.document : document;
+
+        function setSidebarState(collapse) {
+            try {
+                var sidebar = topDoc.querySelector('section[data-testid="stSidebar"]');
+                var collapseBtn = topDoc.querySelector('button[data-testid="stSidebarCollapseButton"]') || 
+                                  topDoc.querySelector('[data-testid="stSidebarCollapseButton"] button');
+                var expandBtn = topDoc.querySelector('[data-testid="stSidebarCollapsedControl"] button') ||
+                                topDoc.querySelector('[data-testid="stSidebarCollapsedControl"]') ||
+                                topDoc.querySelector('button[data-testid="collapsedControl"]');
+
+                if (collapse) {
+                    if (sidebar && sidebar.getAttribute('aria-expanded') !== 'false' && collapseBtn) {
+                        collapseBtn.click();
+                    }
+                } else {
+                    if (expandBtn) {
+                        expandBtn.click();
+                    }
+                }
+            } catch(e) {
+                // Silently ignore if DOM elements are not yet available
+            }
+        }
+
+        function checkAndAttach() {
+            var tabs = topDoc.querySelectorAll('button[data-baseweb="tab"], [role="tab"]');
+            if (!tabs || tabs.length === 0) return;
+
+            tabs.forEach(function(tab) {
+                if (tab.dataset.sidebarSyncAttached === "true") return;
+                tab.dataset.sidebarSyncAttached = "true";
+
+                tab.addEventListener('click', function() {
+                    var txt = (tab.innerText || tab.textContent || '').trim();
+                    var isEscala = txt.indexOf('Escala') >= 0 || txt.indexOf('RT') >= 0;
+                    var isGantt = txt.indexOf('Gantt') >= 0;
+
+                    if (isEscala) {
+                        setSidebarState(true);
+                    } else if (isGantt) {
+                        setSidebarState(false);
+                    }
+                });
+            });
+        }
+
+        checkAndAttach();
+        setInterval(checkAndAttach, 1000);
+    })();
+    </script>
+    """
+    components.html(js_code, height=0, width=0)

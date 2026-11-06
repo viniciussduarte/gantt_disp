@@ -26,6 +26,8 @@ from .ui_components import (
     render_conflicts_tab,
     render_export_tab,
     render_kpi_cards,
+    render_rt_embarques_tab,
+    inject_sidebar_tab_sync,
     render_sidebar_filters,
     render_team_tab,
 )
@@ -54,6 +56,8 @@ __all__ = [
     "render_conflicts_tab",
     "render_export_tab",
     "render_kpi_cards",
+    "render_rt_embarques_tab",
+    "inject_sidebar_tab_sync",
     "render_sidebar_filters",
     "render_team_tab",
 ]

@@ -22,6 +22,8 @@ from src import (
     render_conflicts_tab,
     render_export_tab,
     render_kpi_cards,
+    render_rt_embarques_tab,
+    inject_sidebar_tab_sync,
     render_sidebar_filters,
     render_team_tab,
 )
@@ -36,11 +38,13 @@ class App:
     """Aplicação principal Streamlit que orquestra os dados e renderiza as abas."""
 
     def __init__(self):
+        req_p = st.query_params.get("tab", "")
+        initial_state = "collapsed" if req_p and "escala" in str(req_p).lower() else "expanded"
         st.set_page_config(
             layout="wide",
             page_title=f"Gestão de Alocação & Escalas {VERSION}",
             page_icon="📊",
-            initial_sidebar_state="expanded",
+            initial_sidebar_state=initial_state,
         )
         self.hoje = datetime.today().date()
 
@@ -191,6 +195,7 @@ class App:
             "Escala P-82",
             "Escala P-83",
             "⚠️ Conflitos de Agenda",
+            "🎫 RT Embarques",
             "Sugestões",
             "Log de Edições",
         ]
@@ -211,6 +216,7 @@ class App:
             tabs = st.tabs(tab_names)
 
         tab_dict = {name: tab for name, tab in zip(tab_names, tabs)}
+        inject_sidebar_tab_sync()
 
         with tab_dict["📊 Gráfico de Gantt"]:
             if display_members.empty:
@@ -249,6 +255,9 @@ class App:
 
         with tab_dict["⚠️ Conflitos de Agenda"]:
             render_conflicts_tab(conflicts_df, self.hoje)
+
+        with tab_dict["🎫 RT Embarques"]:
+            render_rt_embarques_tab(combined_df, self.hoje)
 
         with tab_dict["Sugestões"]:
             render_aba_sugestoes()

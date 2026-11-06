@@ -284,6 +284,20 @@ class EscalaP80DB:
                 )
             """)
 
+            # Tabela de Gestão de Requisição de Transporte (RT) dos Embarques
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS p80_embarque_rt (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    projeto TEXT NOT NULL,
+                    nome TEXT NOT NULL,
+                    data_inicio TEXT NOT NULL,
+                    data_fim TEXT NOT NULL,
+                    numero_rt TEXT DEFAULT '',
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(projeto, nome, data_inicio, data_fim)
+                )
+            """)
+
             # Migração: coluna regime_folga em p80_membros ('14x21' ou '14x14')
             cursor.execute("PRAGMA table_info(p80_membros)")
             cols_membros = [row["name"] for row in cursor.fetchall()]
@@ -325,6 +339,55 @@ class EscalaP80DB:
             cursor.execute("UPDATE p80_membros SET regime_folga = ? WHERE UPPER(TRIM(nome)) = ?", (reg_final, nome.strip().upper()))
             conn.commit()
             return cursor.rowcount > 0
+
+    @classmethod
+    def get_embarque_rts(cls) -> Dict[Tuple[str, str, str, str], str]:
+        """Retorna mapeamento {(projeto, nome, data_inicio, data_fim): numero_rt}."""
+        with cls.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT projeto, nome, data_inicio, data_fim, numero_rt FROM p80_embarque_rt")
+            rows = cursor.fetchall()
+            return {(r[0], r[1], r[2], r[3]): (r[4] or "") for r in rows}
+
+    @classmethod
+    def salvar_embarque_rt(cls, projeto: str, nome: str, data_inicio: str, data_fim: str, numero_rt: str) -> bool:
+        """Salva ou atualiza o número de RT para o embarque específico."""
+        proj_norm = normalizar_projeto(projeto)
+        with cls.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO p80_embarque_rt (projeto, nome, data_inicio, data_fim, numero_rt, updated_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(projeto, nome, data_inicio, data_fim) DO UPDATE SET
+                    numero_rt = excluded.numero_rt,
+                    updated_at = CURRENT_TIMESTAMP
+            """, (proj_norm, nome.strip().upper(), str(data_inicio)[:10], str(data_fim)[:10], str(numero_rt).strip()))
+            conn.commit()
+        cls.registrar_log(
+            acao="EDIÇÃO",
+            detalhes=f"Definiu RT '{numero_rt}' para embarque de {nome} em {proj_norm} ({data_inicio} a {data_fim}).",
+            projeto=proj_norm,
+            colaborador=nome
+        )
+        return True
+
+    @classmethod
+    def update_membro(cls, nome: str, disciplina: str, funcao: str, regime_folga: str = "14x21") -> bool:
+        """Atualiza disciplina, função e regime de um colaborador existente."""
+        with cls.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE p80_membros
+                SET disciplina = ?, funcao = ?, regime_folga = ?
+                WHERE UPPER(nome) = UPPER(?)
+            """, (disciplina, funcao, regime_folga, nome.strip()))
+            conn.commit()
+        cls.registrar_log(
+            acao="EQUIPE",
+            detalhes=f"Atualizou cadastro de {nome}: Disciplina={disciplina}, Função={funcao}, Regime={regime_folga}.",
+            colaborador=nome
+        )
+        return True
 
     @classmethod
     def get_config_vagas(cls, projeto: str) -> Dict[str, int]:
@@ -698,6 +761,9 @@ class EscalaP80DB:
             curr = d_inicio
             while curr <= d_fim:
                 iso_date = curr.strftime("%Y-%m-%d")
+                if st_final == "BASE" and curr.weekday() in (5, 6):
+                    curr += timedelta(days=1)
+                    continue
                 cursor.execute("""
                     INSERT INTO p80_escalas (nome, disciplina, projeto, data, status, observacao, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
@@ -1396,7 +1462,11 @@ def integrar_escalas_com_cronograma(
         return merged_map, merged_periodos, lista_conflitos, membros_atualizados, qtd_ext
 
     df_crono["_tipo_norm"] = df_crono["Tipo"].astype(str).str.strip().str.title()
-    tipos_validos = {"Estaleiro", "Férias", "Ferias", "Folga"}
+    tipos_validos = {
+        "Estaleiro", "Férias", "Ferias", "Folga", "Embarque",
+        "Treinamento", "Workshop", "Visita Técnica", "Visita Tecnica",
+        "Licença", "Licenca", "Emprestado"
+    }
     df_crono = df_crono[df_crono["_tipo_norm"].isin(tipos_validos)].copy()
 
     if df_crono.empty:
@@ -1440,16 +1510,33 @@ def integrar_escalas_com_cronograma(
             })
             nomes_atuais.add(nome)
 
-        # Mapeamento estrito solicitado pelo usuário
+        # Mapeamento de tipos do cronograma para a grade da escala
         if tipo_raw == "Estaleiro":
             st_crono = "BASE"
             obs_crono = "Estaleiro (Cronograma)"
         elif tipo_raw in ("Férias", "Ferias"):
             st_crono = "FÉR"
             obs_crono = "Férias (Cronograma)"
-        else: # Folga
+        elif tipo_raw == "Folga":
             st_crono = "FOL"
             obs_crono = "Folga (Cronograma)"
+        elif tipo_raw == "Embarque":
+            st_crono = "EMB"
+            det_val = str(row.get("Detalhamento", "")).strip() if pd.notna(row.get("Detalhamento")) else ""
+            obs_crono = det_val if det_val else "Embarque (Cronograma)"
+        elif tipo_raw in ("Treinamento", "Workshop", "Visita Técnica", "Visita Tecnica"):
+            st_crono = "TREIN"
+            det_val = str(row.get("Detalhamento", "")).strip() if pd.notna(row.get("Detalhamento")) else ""
+            obs_crono = det_val if det_val else f"{tipo_raw} (Cronograma)"
+        elif tipo_raw in ("Licença", "Licenca"):
+            st_crono = "LIC"
+            obs_crono = "Licença (Cronograma)"
+        elif tipo_raw in ("Emprestado",):
+            st_crono = "EMP"
+            obs_crono = "Emprestado (Cronograma)"
+        else:
+            st_crono = "EMB"
+            obs_crono = f"{tipo_raw} (Cronograma)"
 
         d_ini_ev = max(row["_ini"].date(), dt_ini_mes)
         d_fim_ev = min(row["_fim"].date(), dt_fim_mes)
@@ -1457,6 +1544,13 @@ def integrar_escalas_com_cronograma(
         curr = d_ini_ev
         while curr <= d_fim_ev:
             iso_d = curr.strftime("%Y-%m-%d")
+
+            # Regra: Pessoas em BASE só trabalham em dias de semana (segunda a sexta).
+            # Sábados (5) e Domingos (6) NÃO devem receber sinalização de BASE.
+            if st_crono == "BASE" and curr.weekday() in (5, 6):
+                curr += timedelta(days=1)
+                continue
+
             st_sqlite = merged_map.get((nome, iso_d))
 
             if st_sqlite is None:
@@ -1590,9 +1684,13 @@ def build_scala_html(
         membros_filtrados = membros
 
     grupos: Dict[str, List[Dict]] = {d: [] for d in DISCIPLINAS_PADRAO}
+    grupos["FSE"] = []
     for m in membros_filtrados:
+        func = str(m.get("funcao", "")).strip().upper()
         disc = m["disciplina"]
-        if is_mecanica(disc):
+        if func == "FSE":
+            grupos["FSE"].append(m)
+        elif is_mecanica(disc):
             grupos["Mecânica"].append(m)
         elif is_instrumentacao(disc):
             grupos["Instrumentação"].append(m)
@@ -2087,8 +2185,9 @@ def build_scala_html(
         if not lista_membros:
             continue
 
+        label_grupo = "FSE" if disc == "FSE" else disc.upper()
         grid_cells.append(
-            f'<div class="discipline-header">📁 {disc.upper()} ({len(lista_membros)} colaboradores)</div>'
+            f'<div class="discipline-header">📁 {label_grupo} ({len(lista_membros)} colaboradores)</div>'
         )
 
         for m in lista_membros:
@@ -2099,12 +2198,13 @@ def build_scala_html(
             reg_badge = f'<span style="font-size:8.5px;background:#e0f2fe;color:#0369a1;padding:1px 4px;border-radius:3px;margin-left:4px;font-weight:600;">{reg_colab}</span>'
             badge_origem = f'<span class="badge-externo">Externo ({m.get("projeto", "Outro")})</span>' if is_ext else ""
 
+            disc_subtext = f"FSE · {m['disciplina']}" if disc == "FSE" else disc
             grid_cells.append(
-                f'<div class="cell label"><span>{nome}</span><small style="color:#64748b;font-weight:normal;font-size:9px;">{disc}{reg_badge}</small>{badge_origem}</div>'
+                f'<div class="cell label"><span>{nome}</span><small style="color:#64748b;font-weight:normal;font-size:9px;">{disc_subtext}{reg_badge}</small>{badge_origem}</div>'
             )
 
             nome_js = nome.replace("'", "\\'").replace('"', '&quot;')
-            disc_js = disc.replace("'", "\\'").replace('"', '&quot;')
+            disc_js = m["disciplina"].replace("'", "\\'").replace('"', '&quot;')
 
             for idx_dia, dt in enumerate(lista_dias):
                 iso_dt = dt.strftime("%Y-%m-%d")
@@ -2116,6 +2216,10 @@ def build_scala_html(
 
                 status_raw = escalas_map.get((nome, iso_dt))
                 status = normalizar_status(status_raw) if status_raw else None
+
+                # Regra: Em lançamentos de BASE, excluir sinalização nos sábados e domingos
+                if status == "BASE" and dt.weekday() in (5, 6):
+                    status = None
 
                 if status and status in STATUS_MAP:
                     st_info = STATUS_MAP[status]
@@ -2926,6 +3030,7 @@ def build_scala_html(
         var _navigatingEmp = false;
 
         function navegarParaPlataforma(destProj) {{
+            try {{ fecharModalEmp(); }} catch(e) {{}}
             if (!destProj) return;
             var projUpper = destProj.replace('Escala ', '').replace('ESCALA ', '').trim().toUpperCase();
             var projLimpo = destProj.trim();
@@ -2934,71 +3039,14 @@ def build_scala_html(
             else if (projUpper.indexOf('83') >= 0) projLimpo = 'P-83';
             var tabName = 'Escala ' + projLimpo;
 
-            var tabAtivada = false;
-
-            // MÉTODO 1 (MAIS DIRETO, RÁPIDO E CONFIÁVEL NO STREAMLIT):
-            // Aciona o clique no elemento da aba do Streamlit no documento pai (sem recarregar a página)
-            try {{
-                var topDoc = (window.parent && window.parent.document) ? window.parent.document : document;
-                if (topDoc) {{
-                    var tabSelectors = [
-                        '[data-testid="stTab"]',
-                        'button[role="tab"]',
-                        '[role="tab"]',
-                        '[data-baseweb="tab"]',
-                        '.stTabs [role="tab"]',
-                        'div[role="tablist"] button'
-                    ];
-                    var tabs = topDoc.querySelectorAll(tabSelectors.join(','));
-                    for (var i = 0; i < tabs.length; i++) {{
-                        var t = tabs[i];
-                        var txt = (t.innerText || t.textContent || '').trim().replace(/\\s+/g, ' ');
-                        var matchExato = (txt === tabName || txt.indexOf(tabName) >= 0);
-                        var matchSigla = (txt.indexOf(projLimpo) >= 0 && txt.toLowerCase().indexOf('escala') >= 0);
-                        if (matchExato || matchSigla) {{
-                            try {{ t.scrollIntoView({{ behavior: 'smooth', block: 'nearest' }}); }} catch(eScr) {{}}
-                            t.focus();
-                            t.click();
-                            try {{
-                                var clickEvt = new MouseEvent('click', {{
-                                    bubbles: true,
-                                    cancelable: true,
-                                    view: window.parent || window
-                                }});
-                                t.dispatchEvent(clickEvt);
-                            }} catch(eEvt) {{}}
-                            tabAtivada = true;
-                            break;
-                        }}
-                    }}
-                }}
-            }} catch(eDom) {{
-                console.warn("Navegação via clique DOM na aba falhou:", eDom);
-            }}
-
-            // Atualiza a URL na barra de endereços do documento pai para persistência (sem reload)
             try {{
                 var topWin = window.parent || window;
-                if (topWin && topWin.history && topWin.history.pushState) {{
-                    var curUrl = new URL(topWin.location.href);
-                    curUrl.searchParams.set('tab', tabName);
-                    topWin.history.pushState({{ tab: tabName }}, '', curUrl.toString());
-                }}
-            }} catch(eHist) {{}}
-
-            // MÉTODO 2 (FALLBACK SE O CLIQUE DIRETO NA ABA NÃO ENCONTROU O ELEMENTO):
-            if (!tabAtivada) {{
+                var baseUrl = (topWin.location.origin || window.location.origin) + (topWin.location.pathname || '/');
+                topWin.location.href = baseUrl + '?tab=' + encodeURIComponent(tabName);
+                return;
+            }} catch(eTopWin) {{
                 try {{
-                    var topWin = window.parent || window;
-                    var baseUrl = (topWin.location.origin || window.location.origin) + (topWin.location.pathname || '/');
-                    topWin.location.href = baseUrl + '?tab=' + encodeURIComponent(tabName);
-                    return;
-                }} catch(eTopWin) {{
-                    console.warn("Fallback topWin.location falhou:", eTopWin);
-                }}
-
-                try {{
-                    window.top.location.href = (window.location.origin || '') + '/?tab=' + encodeURIComponent(tabName);
+                    window.top.location.href = '/?tab=' + encodeURIComponent(tabName);
                     return;
                 }} catch(eTop) {{
                     console.error("Todas as tentativas de navegação falharam:", eTop);
@@ -3072,13 +3120,7 @@ def build_scala_html(
             }});
         }}
 
-        var btnEmpNav = document.getElementById('emp_nav_btn');
-        if (btnEmpNav) {{
-            btnEmpNav.addEventListener('click', function(e) {{
-                e.preventDefault();
-                executarNavegacaoEmp();
-            }});
-        }}
+
 
         document.addEventListener('keydown', function(e) {{
             if (e.key === 'Escape' || e.key === 'Esc') {{
@@ -3793,7 +3835,8 @@ def render_aba_escala_projeto(
                 with cm2:
                     nova_disc = st.selectbox("Disciplina", DISCIPLINAS_PADRAO, key=f"{pfx}_nova_disc")
                 with cm3:
-                    nova_func = st.text_input("Função (opcional)", value="Técnico", key=f"{pfx}_nova_func")
+                    opcoes_func = ["Técnico", "Engenheiro", "Liderança", "FSE"]
+                    nova_func = st.selectbox("Função", opcoes_func, index=0, key=f"{pfx}_nova_func")
                 with cm4:
                     novo_reg = st.selectbox("Regime Padrão", ["14x21", "14x14"], index=0, key=f"{pfx}_novo_regime")
                 with cm5:
@@ -3807,6 +3850,35 @@ def render_aba_escala_projeto(
                             st.rerun()
                         else:
                             st.error("Informe o nome.")
+
+                st.divider()
+                st.markdown(f"###### Alterar Função / Disciplina de Colaborador em **{proj_norm}**")
+                membros_ativos = [m for m in membros if not m.get("is_externo")]
+                if membros_ativos:
+                    nomes_ativos = [m["nome"] for m in membros_ativos]
+                    ce1, ce2, ce3, ce4 = st.columns([3, 2, 2, 2])
+                    with ce1:
+                        membro_edit = st.selectbox("Colaborador", nomes_ativos, key=f"{pfx}_sel_edit_m")
+                    m_info = next((m for m in membros_ativos if m["nome"] == membro_edit), None)
+                    cur_disc = m_info["disciplina"] if m_info else "Mecânica"
+                    cur_func = m_info.get("funcao", "Técnico") if m_info else "Técnico"
+                    cur_reg = m_info.get("regime_folga", "14x21") if m_info else "14x21"
+
+                    disc_idx = DISCIPLINAS_PADRAO.index(cur_disc) if cur_disc in DISCIPLINAS_PADRAO else 0
+                    func_opts = ["Técnico", "Engenheiro", "Liderança", "FSE"]
+                    func_idx = func_opts.index(cur_func) if cur_func in func_opts else 0
+
+                    with ce2:
+                        edit_disc = st.selectbox("Nova Disciplina", DISCIPLINAS_PADRAO, index=disc_idx, key=f"{pfx}_edit_disc")
+                    with ce3:
+                        edit_func = st.selectbox("Nova Função", func_opts, index=func_idx, key=f"{pfx}_edit_func")
+                    with ce4:
+                        st.write("")
+                        st.write("")
+                        if st.button("💾 Atualizar", key=f"{pfx}_btn_update_membro"):
+                            EscalaP80DB.update_membro(membro_edit, edit_disc, edit_func, cur_reg)
+                            st.success(f"{membro_edit} atualizado: {edit_disc} | {edit_func}!")
+                            st.rerun()
 
                 st.divider()
                 st.markdown(f"###### Desativar Colaborador da Equipe {proj_norm}")
