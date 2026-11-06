@@ -1,747 +1,89 @@
 """
-Aplicação Streamlit para visualização de alocação de equipe, férias e planejamento.
+Entrypoint da aplicação Streamlit: Painel de Disponibilidade e Escalas de Plataforma (v0.3).
 """
-import os
-import warnings
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set, Tuple
 
+import warnings
+from datetime import datetime
 import pandas as pd
-import plotly.graph_objects as go
-import requests
 import streamlit as st
 
 from escala_p80 import (
     render_aba_escala_projeto,
-    render_aba_sugestoes,
     render_aba_log_edicoes,
-    normalizar_projeto,
+    render_aba_sugestoes,
+)
+from src import (
+    VERSION,
+    Config,
+    DataLoader,
+    DataProcessor,
+    MissingColumnError,
+    Visualizer,
+    render_conflicts_tab,
+    render_export_tab,
+    render_kpi_cards,
+    render_sidebar_filters,
+    render_team_tab,
 )
 
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 
+# Reexportação para retrocompatibilidade
+__all__ = ["App", "Config", "DataLoader", "DataProcessor", "Visualizer", "VERSION", "MissingColumnError"]
 
-# --- CONFIGURAÇÃO -----------------------------------------------------------
-class Config:
-    """Configurações e constantes da aplicação."""
 
-    FILE_PATH_ESTALEIRO = "Planejamento Estaleiro.xlsx"
-    FILE_PATH_FERIAS = "Férias.xlsx"
-    FILE_PATH_GERAL = "Planejamento Geral.xlsx"
-
-    GOOGLE_DRIVE_IDS = {
-        "Planejamento Estaleiro.xlsx": "1VYvNJV9V4vUYeQgCA7DjfZY0ggYOpbP3",
-        "Planejamento Geral.xlsx": "1NSP2p69F33kqE_FLvsbfugLjDc2v-fS5",
-    }
-
-    DISCIPLINA_ORDER = ["ELET", "INST", "MEC"]
-
-    DATE_PRESETS = {
-        "Próximos 30 dias": 30,
-        "Próximos 90 dias": 90,
-        "Próximos 6 meses": 180,
-        "Próximo ano": 365,
-        "Personalizado": None,
-    }
-
-    PALETTE = {
-        "Estaleiro": "#2563EB",
-        "Embarque": "#2563EB",
-        "Treinamento": "#2563EB",
-        "Folga": "#6B7280",
-        "Férias": "#6B7280",
-        "Workshop": "#14B8A6",
-        "Visita Técnica": "#EC4899",
-        "Licença": "#9F1239",
-        "Emprestado": "#4338CA",
-    }
-
-    COLOR_TODAY = "#DC2626"
-    COLOR_CONFLICT = "#DC2626"
-    COLOR_WEEKEND = "rgba(100,116,139,0.10)"
-    COLOR_PERIOD = "rgba(59,130,246,0.06)"
-    COLOR_GRID = "rgba(148,163,184,0.35)"
-    COLOR_GRID_MINOR = "rgba(226,232,240,0.55)"
-    COLOR_DIVIDER = "rgba(15,23,42,0.35)"
-
-    HOVER_TEMPLATE = (
-        "<b>%{customdata[3]}</b><br>"
-        "Disciplina: %{customdata[0]}<br>"
-        "Projeto: %{customdata[1]}<br>"
-        "Detalhe: %{customdata[2]}<br>"
-        "%{customdata[4]} → %{customdata[5]} · %{customdata[6]} dias"
-        "<extra></extra>"
-    )
-
-    @classmethod
-    def palette_for(cls, tipo: str) -> str:
-        return cls.PALETTE.get(tipo, "#94A3B8")
-
-
-# --- CARREGAMENTO DE DADOS --------------------------------------------------
-class DataLoader:
-    """Carregamento e normalização de dados a partir das planilhas Excel."""
-
-    @staticmethod
-    def _normalize_dates(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-        for col in cols:
-            if col in df.columns:
-                df[col] = pd.to_datetime(df[col], errors="coerce")
-        return df
-
-    @staticmethod
-    def _to_matricula(series: pd.Series) -> pd.Series:
-        numeric = pd.to_numeric(series, errors="coerce")
-        return numeric.apply(lambda x: str(int(x)) if pd.notna(x) else pd.NA)
-
-    @staticmethod
-    def _download_from_drive(file_id: str, dest_path: str) -> bool:
-        url = f"https://drive.google.com/uc?export=download&id={file_id}"
-        try:
-            resp = requests.get(url, timeout=60)
-            if resp.status_code == 200 and len(resp.content) > 1000:
-                with open(dest_path, "wb") as f:
-                    f.write(resp.content)
-                if dest_path.endswith(".xlsx") and not DataLoader._is_valid_xlsx(dest_path):
-                    return False
-                return True
-            return False
-        except Exception as e:
-            st.error(f"Erro ao baixar do Google Drive ({file_id}): {e}")
-            return False
-
-    @staticmethod
-    def _is_valid_xlsx(path: str) -> bool:
-        try:
-            with open(path, "rb") as f:
-                return f.read(4)[:2] == b"PK"
-        except Exception:
-            return False
-
-    @staticmethod
-    def _ensure_drive_file(filename: str, local_path: str) -> bool:
-        drive_id = Config.GOOGLE_DRIVE_IDS.get(filename)
-        if not drive_id:
-            return os.path.exists(local_path)
-        if DataLoader._download_from_drive(drive_id, local_path):
-            return True
-        return os.path.exists(local_path)
-
-
-    @staticmethod
-    @st.cache_data(ttl=3600, show_spinner="Baixando Planejamento Estaleiro do Google Drive...")
-    def load_estaleiro_data() -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-        if not DataLoader._ensure_drive_file("Planejamento Estaleiro.xlsx", Config.FILE_PATH_ESTALEIRO):
-            st.error("Não foi possível obter o Planejamento Estaleiro (nem do Drive nem local).")
-            return None, None
-        try:
-            equipe_df = pd.read_excel(Config.FILE_PATH_ESTALEIRO, sheet_name="Equipe")
-            keep = ["Disciplina", "Matrícula", "Função", "Projeto", "Experiência", "Nome", "E-mail"]
-            keep = [c for c in keep if c in equipe_df.columns]
-            equipe_df = equipe_df[keep].copy()
-
-            equipe_df = equipe_df.dropna(subset=["Nome", "Matrícula"])
-            equipe_df["Matrícula"] = DataLoader._to_matricula(equipe_df["Matrícula"])
-            equipe_df = equipe_df.dropna(subset=["Matrícula"])
-
-            for c in ["Disciplina", "Função", "Projeto", "Experiência", "E-mail"]:
-                if c in equipe_df.columns:
-                    equipe_df[c] = equipe_df[c].astype("string")
-            equipe_df["Nome"] = equipe_df["Nome"].astype("string").str.strip().str.upper()
-            for c in ["Disciplina", "Função", "Projeto", "Experiência"]:
-                if c in equipe_df.columns:
-                    equipe_df[c] = equipe_df[c].str.strip().str.upper()
-
-            plan_df = pd.read_excel(
-                Config.FILE_PATH_ESTALEIRO,
-                sheet_name="Planejamento IED",
-                skiprows=8,
-                usecols="C:E",
-            )
-            plan_df.columns = ["Nome", "Início", "Término"]
-            plan_df = plan_df.dropna(subset=["Nome"])
-            plan_df["Nome"] = plan_df["Nome"].astype("string").str.strip().str.upper()
-            plan_df = DataLoader._normalize_dates(plan_df, ["Início", "Término"])
-
-            plan_df = plan_df.merge(
-                equipe_df[["Nome", "Matrícula", "Disciplina", "Função", "Projeto"]],
-                on="Nome",
-                how="left",
-            )
-            plan_df["Matrícula"] = DataLoader._to_matricula(plan_df["Matrícula"])
-            plan_df["Tipo"] = "Estaleiro"
-
-            return equipe_df, plan_df
-        except Exception as e:
-            st.error(f"Erro ao carregar o Planejamento Estaleiro: {e}")
-            return None, None
-
-    @staticmethod
-    @st.cache_data(ttl=3600, show_spinner="Carregando Férias...")
-    def load_ferias_data() -> Optional[pd.DataFrame]:
-        try:
-            df = pd.read_excel(Config.FILE_PATH_FERIAS)
-            pairs = [
-                ("Primeira Parcela", "Termino Primeira Parcela"),
-                ("Segunda Parcela", "Termino Segunda Parcela"),
-                ("Terceira Parcela", "Termino Terceira Parcela"),
-            ]
-            frames = []
-            for ini_col, fim_col in pairs:
-                if ini_col not in df.columns or fim_col not in df.columns:
-                    continue
-                tmp = df[["Matrícula", ini_col, fim_col]].copy()
-                tmp.columns = ["Matrícula", "Início", "Término"]
-                tmp = tmp.dropna(subset=["Início"])
-                frames.append(tmp)
-
-            if not frames:
-                ferias = pd.DataFrame(columns=["Matrícula", "Início", "Término", "Tipo"])
-            else:
-                ferias = pd.concat(frames, ignore_index=True)
-                ferias["Matrícula"] = DataLoader._to_matricula(ferias["Matrícula"])
-                ferias = ferias.dropna(subset=["Matrícula"])
-                ferias = DataLoader._normalize_dates(ferias, ["Início", "Término"])
-                ferias["Tipo"] = "Férias"
-            return ferias
-        except Exception as e:
-            st.error(f"Erro ao carregar o arquivo de Férias: {e}")
-            return None
-
-    @staticmethod
-    @st.cache_data(ttl=3600, show_spinner="Baixando Planejamento Geral do Google Drive...")
-    def load_geral_equipe_data() -> Optional[pd.DataFrame]:
-        if not DataLoader._ensure_drive_file("Planejamento Geral.xlsx", Config.FILE_PATH_GERAL):
-            st.error("Não foi possível obter o Planejamento Geral (nem do Drive nem local).")
-            return None
-        try:
-            equipe_df = pd.read_excel(Config.FILE_PATH_GERAL, sheet_name="Equipe")
-            keep = ["Disciplina", "Matrícula", "Função", "Projeto", "Experiência", "Nome", "E-mail"]
-            keep = [c for c in keep if c in equipe_df.columns]
-            equipe_df = equipe_df[keep].copy()
-
-            equipe_df = equipe_df.dropna(subset=["Nome", "Matrícula"])
-            equipe_df["Matrícula"] = DataLoader._to_matricula(equipe_df["Matrícula"])
-            equipe_df = equipe_df.dropna(subset=["Matrícula"])
-
-            for c in ["Disciplina", "Função", "Projeto", "Experiência", "E-mail"]:
-                if c in equipe_df.columns:
-                    equipe_df[c] = equipe_df[c].astype("string")
-            equipe_df["Nome"] = equipe_df["Nome"].astype("string").str.strip().str.upper()
-            for c in ["Disciplina", "Função", "Projeto", "Experiência"]:
-                if c in equipe_df.columns:
-                    equipe_df[c] = equipe_df[c].str.strip().str.upper()
-
-            return equipe_df
-        except Exception as e:
-            st.error(f"Erro ao carregar a aba Equipe do Planejamento Geral: {e}")
-            return None
-
-    @staticmethod
-    @st.cache_data(ttl=3600, show_spinner="Baixando Planejamento Geral do Google Drive...")
-    def load_planejamento_geral() -> Optional[pd.DataFrame]:
-        if not DataLoader._ensure_drive_file("Planejamento Geral.xlsx", Config.FILE_PATH_GERAL):
-            st.error("Não foi possível obter o Planejamento Geral (nem do Drive nem local).")
-            return None
-        try:
-            cols = ["Nome", "Matrícula", "Início", "Término", "Atividade", "Detalhamento", "Plataforma", "Experiência"]
-            df = pd.read_excel(Config.FILE_PATH_GERAL, usecols=cols)
-            df = df.rename(columns={"Atividade": "Tipo"})
-            df["Nome"] = df["Nome"].astype("string").str.strip().str.upper()
-            df["Matrícula"] = DataLoader._to_matricula(df["Matrícula"])
-            df = df.dropna(subset=["Matrícula", "Início"])
-            df = DataLoader._normalize_dates(df, ["Início", "Término"])
-            df["Tipo"] = df["Tipo"].astype("string").str.strip().str.title()
-            valid_types = {"Estaleiro", "Embarque", "Folga", "Férias", "Treinamento", "Workshop", "Visita Técnica", "Atestado"}
-            df = df[df["Tipo"].isin(valid_types)].reset_index(drop=True)
-            return df
-        except Exception as e:
-            st.error(f"Erro ao carregar o Planejamento Geral: {e}")
-            return None
-
-    @staticmethod
-    def load_escalas_plataformas_data(equipe_df: Optional[pd.DataFrame] = None) -> Optional[pd.DataFrame]:
-        try:
-            from escala_p80 import EscalaP80DB
-            periodos, _ = EscalaP80DB.get_periodos_agrupados("TODOS")
-            if not periodos:
-                return pd.DataFrame(columns=["Nome", "Matrícula", "Início", "Término", "Tipo", "Plataforma", "Detalhamento"])
-
-            tipo_map = {
-                "EMB": "Embarque",
-                "E": "Embarque",
-                "FOL": "Folga",
-                "FÉR": "Férias",
-                "FÉRIAS": "Férias",
-                "BASE": "Estaleiro",
-                "TREIN": "Treinamento",
-                "TREINAMENTO": "Treinamento",
-                "PMB": "Treinamento",
-                "LIC": "Licença",
-                "LICENÇA": "Licença",
-                "LICENCA": "Licença",
-                "EMP": "Emprestado",
-                "EMPRESTADO": "Emprestado",
-            }
-
-            rows = []
-            for p in periodos:
-                st_tipo = tipo_map.get(p["status"], "Embarque")
-                rows.append({
-                    "Nome": p["nome"],
-                    "Início": pd.Timestamp(p["inicio"]),
-                    "Término": pd.Timestamp(p["fim"]),
-                    "Tipo": st_tipo,
-                    "Plataforma": p.get("projeto", "P-80"),
-                    "Detalhamento": f"Escala {p.get('projeto', 'P-80')}",
-                })
-
-            df = pd.DataFrame(rows)
-            if equipe_df is not None and not equipe_df.empty:
-                df = df.merge(
-                    equipe_df[["Nome", "Matrícula"]].drop_duplicates(subset=["Nome"]),
-                    on="Nome",
-                    how="left"
-                )
-            else:
-                df["Matrícula"] = pd.NA
-            return df
-        except Exception:
-            return None
-
-
-# --- PROCESSAMENTO ----------------------------------------------------------
-class DataProcessor:
-    """Combinação de fontes, cálculo de disponibilidade e detecção de conflitos."""
-
-    @staticmethod
-    def _mat_set(series: pd.Series) -> Set:
-        return set(series.dropna().astype(str))
-
-    @staticmethod
-    def prepare_combined_data(
-        equipe_df: pd.DataFrame,
-        dfs_eventos: List[Optional[pd.DataFrame]],
-    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        valid_dfs = []
-        matriculas_validas = DataProcessor._mat_set(equipe_df["Matrícula"])
-
-        for df in dfs_eventos:
-            if df is None or df.empty:
-                continue
-            df = df[df["Matrícula"].astype(str).isin(matriculas_validas)].copy()
-            cols = ["Matrícula", "Início", "Término", "Tipo"]
-            for extra in ["Nome", "Detalhamento", "Plataforma"]:
-                if extra in df.columns:
-                    cols.append(extra)
-            valid_dfs.append(df[cols])
-
-        if not valid_dfs:
-            combined = pd.DataFrame(columns=["Matrícula", "Nome", "Início", "Término", "Disciplina", "Tipo"])
-        else:
-            combined = pd.concat(valid_dfs, ignore_index=True)
-
-        for c in ["Detalhamento", "Plataforma"]:
-            if c not in combined.columns:
-                combined[c] = pd.NA
-
-        combined = combined.dropna(subset=["Início", "Término"])
-        combined["Tipo"] = combined["Tipo"].astype("string").str.strip().str.title()
-        valid_types = {"Estaleiro", "Embarque", "Folga", "Férias", "Treinamento", "Workshop", "Visita Técnica", "Atestado"}
-        combined = combined[combined["Tipo"].isin(valid_types)].reset_index(drop=True)
-        combined = combined.merge(
-            equipe_df[["Matrícula", "Nome", "Disciplina", "Função", "Projeto", "Experiência"]],
-            on="Matrícula",
-            how="left",
-            suffixes=("", "_eq"),
-        )
-        for c in ["Nome", "Disciplina", "Função", "Projeto", "Experiência"]:
-            eq = f"{c}_eq"
-            if eq in combined.columns:
-                combined[c] = combined[eq].where(combined[eq].notna(), combined[c])
-                combined = combined.drop(columns=[eq])
-
-        disc_rank = {d: i for i, d in enumerate(Config.DISCIPLINA_ORDER)}
-        unique_members = equipe_df.copy()
-        unique_members["_rank"] = unique_members["Disciplina"].map(disc_rank).fillna(999)
-        unique_members = unique_members.sort_values(["_rank", "Função", "Projeto", "Nome"]).drop(columns="_rank")
-        unique_members = unique_members.reset_index(drop=True)
-
-        return combined, unique_members
-
-    @staticmethod
-    def available_in_period(
-        unique_members: pd.DataFrame,
-        combined_df: pd.DataFrame,
-        start_date: pd.Timestamp,
-        end_date: pd.Timestamp,
-    ) -> Set:
-        if combined_df.empty:
-            return DataProcessor._mat_set(unique_members["Matrícula"])
-        mask = (combined_df["Início"] <= end_date) & (combined_df["Término"] >= start_date)
-        occupied = DataProcessor._mat_set(combined_df.loc[mask, "Matrícula"])
-        return DataProcessor._mat_set(unique_members["Matrícula"]) - occupied
-
-    @staticmethod
-    def occupied_in_period(
-        combined_df: pd.DataFrame,
-        start_date: pd.Timestamp,
-        end_date: pd.Timestamp,
-    ) -> Set:
-        if combined_df.empty:
-            return set()
-        mask = (combined_df["Início"] <= end_date) & (combined_df["Término"] >= start_date)
-        return DataProcessor._mat_set(combined_df.loc[mask, "Matrícula"])
-
-    @staticmethod
-    def events_in_period(
-        combined_df: pd.DataFrame,
-        start_date: pd.Timestamp,
-        end_date: pd.Timestamp,
-    ) -> pd.DataFrame:
-        if combined_df.empty:
-            return combined_df
-        mask = (combined_df["Início"] <= end_date) & (combined_df["Término"] >= start_date)
-        return combined_df.loc[mask].copy()
-
-    @staticmethod
-    def detect_conflicts(combined_df: pd.DataFrame) -> Tuple[pd.DataFrame, Set]:
-        if combined_df.empty:
-            return pd.DataFrame(), set()
-
-        df = combined_df.dropna(subset=["Início", "Término"]).copy()
-        rows = []
-        keys: Set = set()
-
-        for mat, group in df.groupby("Matrícula"):
-            group = group.sort_values("Início").reset_index(drop=True)
-            values = group.to_dict("records")
-            for i in range(len(values)):
-                a = values[i]
-                for j in range(i + 1, len(values)):
-                    b = values[j]
-                    if a["Início"] <= b["Término"] and b["Início"] <= a["Término"]:
-                        overlap_start = max(a["Início"], b["Início"])
-                        overlap_end = min(a["Término"], b["Término"])
-                        overlap = overlap_end - overlap_start
-                        overlap_days = overlap.days + 1
-
-                        proj_val = None
-                        for item in (a, b):
-                            for col_name in ("Projeto", "Plataforma"):
-                                v = item.get(col_name)
-                                if pd.notna(v) and str(v).strip() != "" and str(v).strip().lower() != "nan":
-                                    proj_val = str(v).strip()
-                                    break
-                            if proj_val:
-                                break
-                        proj_norm = normalizar_projeto(proj_val) if proj_val else "P-80"
-
-                        rows.append({
-                            "Nome": a["Nome"],
-                            "Matrícula": mat,
-                            "Projeto": proj_norm,
-                            "Atividade A": a["Tipo"],
-                            "Período A": f"{a['Início']:%d/%m/%Y} – {a['Término']:%d/%m/%Y}",
-                            "Início A": a["Início"],
-                            "Término A": a["Término"],
-                            "Atividade B": b["Tipo"],
-                            "Período B": f"{b['Início']:%d/%m/%Y} – {b['Término']:%d/%m/%Y}",
-                            "Início B": b["Início"],
-                            "Término B": b["Término"],
-                            "Início Conflito": overlap_start,
-                            "Término Conflito": overlap_end,
-                            "Período Conflito": f"{overlap_start:%d/%m/%Y} – {overlap_end:%d/%m/%Y}",
-                            "Sobreposição (dias)": overlap_days,
-                        })
-                        keys.add((int(mat), a["Início"], a["Tipo"]))
-                        keys.add((int(mat), b["Início"], b["Tipo"]))
-                    elif b["Início"] > a["Término"]:
-                        break
-
-        cols = [
-            "Nome", "Matrícula", "Projeto", "Atividade A", "Período A", "Início A", "Término A",
-            "Atividade B", "Período B", "Início B", "Término B",
-            "Início Conflito", "Término Conflito", "Período Conflito", "Sobreposição (dias)",
-        ]
-        conflicts = pd.DataFrame(rows, columns=cols)
-        return conflicts, keys
-
-
-# --- VISUALIZAÇÃO -----------------------------------------------------------
-class Visualizer:
-    @staticmethod
-    def create_gantt_chart(
-        chart_df: pd.DataFrame,
-        unique_members: pd.DataFrame,
-        start_date: pd.Timestamp,
-        end_date: pd.Timestamp,
-        conflict_keys: Set,
-        conflict_details: Dict,
-        y_ticktext: List[str],
-    ) -> go.Figure:
-        names = unique_members["Nome"].astype(str).tolist()
-        n = len(names)
-        fig = go.Figure()
-
-        if not chart_df.empty:
-            chart_df = chart_df.dropna(subset=["Início", "Término"]).copy()
-            det = chart_df["Detalhamento"] if "Detalhamento" in chart_df.columns else pd.Series(pd.NA, index=chart_df.index)
-            if "Plataforma" in chart_df.columns:
-                det = det.where(det.notna(), chart_df["Plataforma"])
-            det = det.fillna("—").astype(str)
-
-            for tipo in Config.PALETTE:
-                g = chart_df[chart_df["Tipo"] == tipo]
-                if g.empty:
-                    continue
-                g = g.sort_values("Nome")
-                starts = g["Início"]
-                ends = g["Término"]
-                start_ms = starts.astype("datetime64[ms]").astype("int64")
-                end_ms = (ends + pd.Timedelta(days=1)).astype("datetime64[ms]").astype("int64")
-                x_ms = (end_ms - start_ms)
-                dias = (ends - starts).dt.days + 1
-
-                custom = pd.DataFrame({
-                    "Disciplina": g["Disciplina"].fillna("—").astype(str),
-                    "Projeto": g["Projeto"].fillna("—").astype(str),
-                    "Detalhe": det.loc[g.index],
-                    "Tipo": [tipo] * len(g),
-                    "ini": starts.dt.strftime("%d/%m/%Y"),
-                    "fim": ends.dt.strftime("%d/%m/%Y"),
-                    "dias": dias.astype(int).astype(str),
-                })
-
-                fig.add_trace(go.Bar(
-                    y=g["Nome"].astype(str).tolist(),
-                    x=x_ms.tolist(),
-                    base=start_ms.tolist(),
-                    orientation="h",
-                    name=tipo,
-                    marker=dict(
-                        color=Config.palette_for(tipo),
-                        line=dict(width=1, color="rgba(15,23,42,0.35)"),
-                    ),
-                    customdata=custom.values.tolist(),
-                    hovertemplate=Config.HOVER_TEMPLATE,
-                    showlegend=True,
-                ))
-
-        if not chart_df.empty and conflict_keys:
-            conflict_mask = []
-            for _, r in chart_df.iterrows():
-                key = (int(r["Matrícula"]) if pd.notna(r["Matrícula"]) else None, pd.Timestamp(r["Início"]), r["Tipo"])
-                conflict_mask.append(key in conflict_keys)
-            chart_df_conf = chart_df[conflict_mask].copy()
-            if not chart_df_conf.empty:
-                starts_c = chart_df_conf["Início"]
-                ends_c = chart_df_conf["Término"]
-                start_ms_c = starts_c.astype("datetime64[ms]").astype("int64")
-                end_ms_c = (ends_c + pd.Timedelta(days=1)).astype("datetime64[ms]").astype("int64")
-                x_ms_c = (end_ms_c - start_ms_c)
-                custom_conf = []
-                for _, r in chart_df_conf.iterrows():
-                    key = (int(r["Matrícula"]) if pd.notna(r["Matrícula"]) else None, pd.Timestamp(r["Início"]), r["Tipo"])
-                    details = conflict_details.get(key, ["Conflito"])
-                    custom_conf.append(["\n".join(details)])
-                fig.add_trace(go.Bar(
-                    y=chart_df_conf["Nome"].astype(str).tolist(),
-                    x=x_ms_c.tolist(),
-                    base=start_ms_c.tolist(),
-                    orientation="h",
-                    name="Conflito",
-                    marker=dict(color="rgba(220,38,38,0.25)", line=dict(width=0)),
-                    customdata=custom_conf,
-                    hovertemplate="<b>Conflito(s)</b><br>%{customdata[0]}<extra></extra>",
-                    showlegend=True,
-                ))
-
-        if len(fig.data) == 0:
-            fig.add_trace(go.Scatter(
-                y=list(range(len(names))),
-                x=[0] * len(names),
-                mode="markers",
-                marker=dict(opacity=0, size=0),
-                showlegend=False,
-                hoverinfo="skip",
-                hovertemplate=None,
-            ))
-
-        x0 = start_date - pd.Timedelta(days=1)
-        x1 = end_date + pd.Timedelta(days=4)
-
-        fig.add_shape(
-            type="rect", xref="x", yref="paper",
-            x0=start_date, x1=end_date + pd.Timedelta(days=1),
-            y0=0, y1=1, fillcolor=Config.COLOR_PERIOD, line_width=0, layer="below",
-        )
-
-        d = (x0.normalize()).to_pydatetime()
-        end_d = x1.to_pydatetime()
-        while d <= end_d:
-            if d.weekday() == 5:
-                fig.add_shape(
-                    type="rect", xref="x", yref="paper",
-                    x0=d, x1=d + timedelta(days=2),
-                    y0=0, y1=1, fillcolor=Config.COLOR_WEEKEND, line_width=0, layer="below",
-                )
-                d += timedelta(days=2)
-            else:
-                d += timedelta(days=1)
-
-        hoje = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        fig.add_vline(x=hoje, line=dict(color=Config.COLOR_TODAY, width=2, dash="dash"))
-        fig.add_annotation(
-            x=hoje, y=1.0, xref="x", yref="paper",
-            text="Hoje", showarrow=False, yanchor="bottom",
-            font=dict(color=Config.COLOR_TODAY, size=11),
-        )
-
-        discs = unique_members["Disciplina"].astype("object").tolist()
-        prev = None
-        first_idx = 0
-        for i, disc in enumerate(discs):
-            if prev is not None and disc != prev:
-                fig.add_hline(y=i - 0.5, line=dict(color=Config.COLOR_DIVIDER, width=1, dash="dot"))
-                center = (first_idx + i - 1) / 2
-                fig.add_annotation(
-                    x=1, y=center, xref="paper", yref="y", text=f"<b>{prev}</b>",
-                    showarrow=False, xanchor="right", font=dict(size=11, color="#334155"),
-                )
-                first_idx = i
-            if prev is None:
-                first_idx = i
-            prev = disc
-        if prev is not None:
-            center = (first_idx + len(discs) - 1) / 2
-            fig.add_annotation(
-                x=1, y=center, xref="paper", yref="y", text=f"<b>{prev}</b>",
-                showarrow=False, xanchor="right", font=dict(size=11, color="#334155"),
-            )
-
-        cur = start_date.normalize()
-        end_norm = end_date.normalize()
-        while cur <= end_norm:
-            if cur.weekday() == 0:
-                fig.add_vline(
-                    x=cur,
-                    line=dict(color="rgba(148,163,184,0.25)", width=1, dash="dot"),
-                    layer="below",
-                )
-                fig.add_annotation(
-                    x=cur, y=1.0, xref="x", yref="paper",
-                    text=cur.strftime("%d/%m/%Y"),
-                    showarrow=False,
-                    xanchor="center", yanchor="bottom",
-                    textangle=-45,
-                    font=dict(size=10, color="#475569"),
-                    yshift=4,
-                )
-            cur += timedelta(days=1)
-
-        fig.update_layout(
-            height=max(650, n * 32),
-            barmode="overlay",
-            bargap=0.25,
-            bargroupgap=0,
-            plot_bgcolor="white",
-            paper_bgcolor="white",
-            margin=dict(l=8, r=8, t=60, b=50),
-            title=dict(text="Cronograma de Alocação", x=0.01, xanchor="left", font=dict(size=16, color="#0f172a")),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, title="Atividade"),
-            hovermode="closest",
-            hoverlabel=dict(bgcolor="white", font_size=12, bordercolor="#cbd5e1"),
-            xaxis=dict(
-                type="date",
-                range=[x0, x1],
-                rangeslider=dict(visible=True, thickness=0.05),
-                dtick="M1",
-                tickformat="%b\n%Y",
-                showgrid=True,
-                gridcolor=Config.COLOR_GRID,
-                minor=dict(showgrid=True, dtick=86400000, gridcolor=Config.COLOR_GRID_MINOR),
-                zeroline=False,
-            ),
-            yaxis=dict(
-                categoryorder="array",
-                categoryarray=names,
-                range=[len(names) - 0.5, -0.5],
-                tickmode="array",
-                tickvals=list(range(len(names))),
-                ticktext=y_ticktext,
-                dtick=1,
-                showgrid=True,
-                gridcolor="rgba(226,232,240,0.8)",
-                zeroline=False,
-                tickfont=dict(size=11),
-            ),
-        )
-        return fig
-
-
-# --- APLICAÇÃO PRINCIPAL ----------------------------------------------------
 class App:
+    """Aplicação principal Streamlit que orquestra os dados e renderiza as abas."""
+
     def __init__(self):
         st.set_page_config(
             layout="wide",
-            page_title="Gestão de Alocação & Escalas v0.2",
+            page_title=f"Gestão de Alocação & Escalas {VERSION}",
             page_icon="📊",
             initial_sidebar_state="expanded",
         )
         self.hoje = datetime.today().date()
 
     def run(self):
-        st.title("🚢 Painel de Disponibilidade e Escalas de Plataforma — v0.2")
-        st.caption("Visualização integrada de Estaleiro, Férias, Planejamento Geral e Escalas P-80, P-82 e P-83 (v0.2).")
+        st.title(f"🚢 Painel de Disponibilidade e Escalas de Plataforma — {VERSION}")
+        st.caption(
+            f"Visualização integrada de Estaleiro, Férias, Planejamento Geral e Escalas P-80, P-82 e P-83 ({VERSION})."
+        )
 
-        with st.sidebar:
-            st.header("Filtros")
-            if st.button("🔄 Atualizar dados", use_container_width=True, help="Recarrega as planilhas ignorando o cache"):
-                st.cache_data.clear()
-                st.rerun()
+        DataLoader.clear_inconsistencias()
 
+        # 1. Carregamento prévio da equipe com tratamento fail-fast amigável
+        try:
             equipe_df = DataLoader.load_geral_equipe_data()
-            _, plan_df = DataLoader.load_estaleiro_data()
-            ferias_df = DataLoader.load_ferias_data()
-            geral_df = DataLoader.load_planejamento_geral()
-            plataformas_df = DataLoader.load_escalas_plataformas_data(equipe_df)
+        except MissingColumnError as e:
+            st.error(f"❌ Erro de Validação de Colunas: {e}")
+            return
+        except Exception as e:
+            st.error(f"❌ Erro inesperado ao carregar dados da equipe: {e}")
+            return
 
-            if equipe_df is None:
-                st.error("Falha ao carregar a aba Equipe do Planejamento Geral.")
+        if equipe_df is None:
+            st.error("Falha ao carregar a aba Equipe do Planejamento Geral.")
+            return
+
+        # 2. Barra lateral com filtros e upload opcional de arquivos
+        (
+            sel_discs,
+            sel_projs,
+            sel_funcoes,
+            d_inicio,
+            d_fim,
+            only_available,
+            uploaded_files,
+        ) = render_sidebar_filters(equipe_df, self.hoje)
+
+        # Se o usuário fez upload de um novo Planejamento Geral, recarrega a equipe a partir dele
+        if uploaded_files.get("geral") is not None:
+            try:
+                equipe_df = DataLoader.load_geral_equipe_data(source=uploaded_files["geral"])
+            except MissingColumnError as e:
+                st.error(f"❌ Erro no arquivo enviado: {e}")
                 return
-
-            all_discs = sorted([x for x in equipe_df["Disciplina"].dropna().unique()])
-            sel_discs = st.multiselect("Disciplina", all_discs, default=all_discs)
-            all_projs = sorted([x for x in equipe_df["Projeto"].dropna().unique()])
-            sel_projs = st.multiselect("Projeto", all_projs, default=all_projs)
-
-            funcao_map = {"SUPERVISOR": "LIDERANÇA", "COORDENADOR": "LIDERANÇA"}
-            equipe_df["FunçãoAgrupada"] = equipe_df["Função"].map(
-                lambda f: funcao_map.get(f, f) if pd.notna(f) else f
-            )
-            all_funcoes = sorted([x for x in equipe_df["FunçãoAgrupada"].dropna().unique()])
-            sel_funcoes = st.multiselect("Função", all_funcoes, default=all_funcoes)
-
-            preset = st.selectbox("Período", list(Config.DATE_PRESETS.keys()), index=1)
-            dias = Config.DATE_PRESETS[preset]
-            if dias is not None:
-                d_inicio = pd.Timestamp(self.hoje - timedelta(days=7))
-                d_fim = pd.Timestamp(self.hoje + timedelta(days=dias))
-                st.caption(f"{d_inicio:%d/%m/%Y} a {d_fim:%d/%m/%Y}")
-            else:
-                col1, col2 = st.columns(2)
-                d_inicio = pd.Timestamp(col1.date_input("Início", self.hoje - timedelta(days=7)))
-                d_fim = pd.Timestamp(col2.date_input("Fim", self.hoje + timedelta(days=90)))
-
-            if d_inicio > d_fim:
-                st.sidebar.warning("Data de início posterior à data de fim. Invertendo...")
-                d_inicio, d_fim = d_fim, d_inicio
-
-            only_available = st.checkbox(
-                "Apenas disponíveis no período",
-                help="Mostra apenas quem não tem nenhum evento agendado dentro do período selecionado",
-            )
 
         equipe_filtered = equipe_df[
             equipe_df["Disciplina"].isin(sel_discs)
@@ -753,6 +95,33 @@ class App:
             st.warning("Nenhum colaborador encontrado com os filtros atuais.")
             return
 
+        # 3. Carregamento dos dados de eventos com suporte a uploads e validação fail-fast
+        try:
+            _, plan_df = DataLoader.load_estaleiro_data(source=uploaded_files.get("estaleiro"))
+            ferias_df = DataLoader.load_ferias_data(source=uploaded_files.get("ferias"))
+            geral_df = DataLoader.load_planejamento_geral(source=uploaded_files.get("geral"))
+            plataformas_df = DataLoader.load_escalas_plataformas_data(equipe_df)
+        except MissingColumnError as e:
+            st.error(f"❌ Erro de Validação de Cabeçalhos: {e}")
+            return
+        except Exception as e:
+            st.error(f"❌ Erro ao ler planilhas: {e}")
+            return
+
+        # Alerta expansível de inconsistências de datas detectadas
+        df_inconsistencias = DataLoader.get_inconsistencias()
+        if not df_inconsistencias.empty:
+            with st.expander(
+                f"⚠️ Inconsistências de Datas Detectadas ({len(df_inconsistencias)} linha(s) ignorada(s))",
+                expanded=False,
+            ):
+                st.warning(
+                    "As linhas abaixo possuem valores nulos/inválidos (NaT) ou data de término anterior ao início. "
+                    "Elas foram desconsideradas para garantir a integridade dos cálculos do cronograma:"
+                )
+                st.dataframe(df_inconsistencias, use_container_width=True, hide_index=True)
+
+        # 4. Consolidação de eventos e cálculo vetorizado de conflitos
         combined_df, unique_members = DataProcessor.prepare_combined_data(
             equipe_filtered, [plan_df, ferias_df, geral_df, plataformas_df]
         )
@@ -761,16 +130,11 @@ class App:
         familiar_available = DataProcessor.available_in_period(unique_members, combined_df, d_inicio, d_fim)
         events_in_window = DataProcessor.events_in_period(combined_df, d_inicio, d_fim)
         conflicts_full, conflict_keys = DataProcessor.detect_conflicts(combined_df)
-        hoje_ts = pd.Timestamp(self.hoje)
-        # Filtra apenas conflitos futuros (onde o término da sobreposição é estritamente posterior ao dia atual)
-        if not conflicts_full.empty and "Término Conflito" in conflicts_full.columns:
-            conflicts_futuros = conflicts_full[conflicts_full["Término Conflito"] > hoje_ts].copy().reset_index(drop=True)
-        else:
-            conflicts_futuros = pd.DataFrame(columns=conflicts_full.columns)
+        conflicts_futuros = DataProcessor.filter_future_conflicts(conflicts_full, pd.Timestamp(self.hoje))
 
         display_cols = [
-            "Nome", "Projeto", "Atividade A", "Período A", "Atividade B", "Período B",
-            "Período Conflito", "Sobreposição (dias)"
+            "Severidade", "Nome", "Projeto", "Atividade A", "Período A", "Atividade B", "Período B",
+            "Período Conflito", "Sobreposição (dias)", "Detalhe_Conflito"
         ]
         conflicts_df = (
             conflicts_futuros[[c for c in display_cols if c in conflicts_futuros.columns]].copy()
@@ -778,59 +142,77 @@ class App:
             else pd.DataFrame(columns=display_cols)
         )
 
-        conflict_details = {}
-        if not conflicts_full.empty:
-            for _, row in conflicts_full.iterrows():
-                key_a = (int(row["Matrícula"]), pd.Timestamp(row["Início A"]), row["Atividade A"])
-                key_b = (int(row["Matrícula"]), pd.Timestamp(row["Início B"]), row["Atividade B"])
-                desc = f"{row['Atividade A']} ({row['Período A']}) x {row['Atividade B']} ({row['Período B']})"
-                conflict_details.setdefault(key_a, []).append(desc)
-                conflict_details.setdefault(key_b, []).append(desc)
+        conflict_details = DataProcessor.build_conflict_details(conflicts_full)
 
-        n_total = len(unique_members)
-        n_available = len(familiar_available)
-        n_occupied = n_total - n_available
+        # 5. Cálculo das métricas de KPIs no Topo (Tarefa 5)
+        hoje_ts = pd.Timestamp(self.hoje)
+        total_filtrados = len(unique_members)
 
-        k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("Equipe no filtro", n_total)
-        k2.metric("Disponíveis", n_available)
-        k3.metric("Ocupados no período", n_occupied)
-        k4.metric("Eventos no período", len(events_in_window))
-        k5.metric("Conflitos (Futuros)", len(conflicts_df), help="Apenas conflitos futuros com término posterior a hoje")
+        # Ativos hoje: colaboradores com evento ativo hoje (exceto férias/folga pura)
+        mask_ativos = (
+            (combined_df["Início"] <= hoje_ts)
+            & (combined_df["Término"] >= hoje_ts)
+            & (combined_df["Tipo"].isin(["Estaleiro", "Embarque", "Treinamento", "Workshop", "Visita Técnica"]))
+        )
+        ativos_hoje = len(set(combined_df.loc[mask_ativos, "Matrícula"].dropna()))
 
+        # Em férias hoje: colaboradores com férias/licença vigentes na data atual
+        mask_ferias = (
+            (combined_df["Início"] <= hoje_ts)
+            & (combined_df["Término"] >= hoje_ts)
+            & (combined_df["Tipo"].isin(["Férias", "Licença"]))
+        )
+        ferias_hoje = len(set(combined_df.loc[mask_ferias, "Matrícula"].dropna()))
+
+        total_conflitos = len(conflicts_df)
+
+        render_kpi_cards(total_filtrados, ativos_hoje, ferias_hoje, total_conflitos)
+
+        # 6. Filtragem para visualização do Gantt
         display_members = unique_members.copy()
         if only_available:
             display_members = display_members[
                 display_members["Matrícula"].astype(str).isin(familiar_available)
             ].reset_index(drop=True)
 
-        chart_df = combined_df[combined_df["Matrícula"].isin(set(display_members["Matrícula"]))].copy() if not display_members.empty else pd.DataFrame()
+        chart_df = (
+            combined_df[combined_df["Matrícula"].isin(set(display_members["Matrícula"]))].copy()
+            if not display_members.empty
+            else pd.DataFrame()
+        )
         chart_df = DataProcessor.events_in_period(chart_df, d_inicio, d_fim) if not chart_df.empty else chart_df
 
+        # 7. Abas da aplicação (Conflitos após as 3 escalas; Equipe e Consolidados visíveis apenas no modo edição)
+        is_editor = bool(st.session_state.get("escala_is_editor", False))
+
         tab_names = [
-            "Cronograma",
+            "📊 Gráfico de Gantt",
             "Escala P-80",
             "Escala P-82",
             "Escala P-83",
-            "Conflitos",
+            "⚠️ Conflitos de Agenda",
             "Sugestões",
             "Log de Edições",
-            "Equipe",
-            "Exportar",
         ]
-        # Preserva aba selecionada caso informada via query_param ou session state
-        req_tab = st.query_params.get("tab") or st.session_state.get("active_main_tab")
-        if req_tab in tab_names:
-            tab_crono, tab_p80, tab_p82, tab_p83, tab_conf, tab_sugest, tab_log, tab_equipe, tab_export = st.tabs(
-                tab_names,
-                default=req_tab
-            )
-        else:
-            tab_crono, tab_p80, tab_p82, tab_p83, tab_conf, tab_sugest, tab_log, tab_equipe, tab_export = st.tabs(
-                tab_names
-            )
+        if is_editor:
+            tab_names.extend(["Equipe", "📋 Dados Consolidados"])
 
-        with tab_crono:
+        req_tab = st.query_params.get("tab") or st.session_state.get("active_main_tab")
+        default_tab = None
+        if req_tab:
+            for t in tab_names:
+                if req_tab.lower() in t.lower() or t.lower() in req_tab.lower():
+                    default_tab = t
+                    break
+
+        if default_tab in tab_names:
+            tabs = st.tabs(tab_names, default=default_tab)
+        else:
+            tabs = st.tabs(tab_names)
+
+        tab_dict = {name: tab for name, tab in zip(tab_names, tabs)}
+
+        with tab_dict["📊 Gráfico de Gantt"]:
             if display_members.empty:
                 st.info("Nenhum colaborador disponível para os critérios selecionados.")
             else:
@@ -842,104 +224,46 @@ class App:
                         y_ticktext.append(f'<span style="color:#10B981;font-weight:bold">{nome}</span>')
                     else:
                         y_ticktext.append(f'<span style="color:#EF4444;font-weight:bold">{nome}</span>')
-                fig = Visualizer.create_gantt_chart(chart_df, display_members, d_inicio, d_fim, conflict_keys, conflict_details, y_ticktext)
+                fig = Visualizer.create_gantt_chart(
+                    chart_df,
+                    display_members,
+                    d_inicio,
+                    d_fim,
+                    conflict_keys,
+                    conflict_details,
+                    y_ticktext,
+                )
                 st.plotly_chart(fig, use_container_width=True)
-                st.caption("Verde = disponível no período | Vermelho = ocupado | Barras vermelhas sobrepostas indicam conflitos.")
+                st.caption(
+                    "Verde = disponível no período | Vermelho = ocupado | Barras vermelhas sobrepostas indicam conflitos."
+                )
 
-        with tab_p80:
+        with tab_dict["Escala P-80"]:
             render_aba_escala_projeto("P-80", equipe_geral_df=equipe_df, cronograma_df=combined_df)
 
-        with tab_p82:
+        with tab_dict["Escala P-82"]:
             render_aba_escala_projeto("P-82", equipe_geral_df=equipe_df, cronograma_df=combined_df)
 
-        with tab_p83:
+        with tab_dict["Escala P-83"]:
             render_aba_escala_projeto("P-83", equipe_geral_df=equipe_df, cronograma_df=combined_df)
 
-        with tab_conf:
-            st.subheader("Relatório de Conflitos Futuros")
-            st.caption(f"Mostrando e mensurando apenas conflitos com data fim maior que o dia atual ({self.hoje:%d/%m/%Y}).")
+        with tab_dict["⚠️ Conflitos de Agenda"]:
+            render_conflicts_tab(conflicts_df, self.hoje)
 
-            if conflicts_df.empty:
-                st.success("✅ Nenhum conflito futuro de agendamento detectado.")
-            else:
-                df_p80 = conflicts_df[conflicts_df["Projeto"] == "P-80"].reset_index(drop=True)
-                df_p82 = conflicts_df[conflicts_df["Projeto"] == "P-82"].reset_index(drop=True)
-                df_p83 = conflicts_df[conflicts_df["Projeto"] == "P-83"].reset_index(drop=True)
-                df_outros = conflicts_df[~conflicts_df["Projeto"].isin(["P-80", "P-82", "P-83"])].reset_index(drop=True)
-
-                c1, c2, c3 = st.columns(3)
-                c1.metric("P-80", f"{len(df_p80)} conflito(s)")
-                c2.metric("P-82", f"{len(df_p82)} conflito(s)")
-                c3.metric("P-83", f"{len(df_p83)} conflito(s)")
-
-                st.markdown("---")
-
-                tab_labels = [f"P-80 ({len(df_p80)})", f"P-82 ({len(df_p82)})", f"P-83 ({len(df_p83)})"]
-                if not df_outros.empty:
-                    tab_labels.append(f"Outros ({len(df_outros)})")
-
-                subtabs = st.tabs(tab_labels)
-                cols_sub = [
-                    c for c in ["Nome", "Atividade A", "Período A", "Atividade B", "Período B", "Período Conflito", "Sobreposição (dias)"]
-                    if c in conflicts_df.columns
-                ]
-
-                with subtabs[0]:
-                    if df_p80.empty:
-                        st.info("Nenhum conflito futuro detectado para P-80.")
-                    else:
-                        st.warning(f"⚠️ {len(df_p80)} conflito(s) futuro(s) encontrado(s) para P-80.")
-                        st.dataframe(df_p80[cols_sub], use_container_width=True, hide_index=True)
-
-                with subtabs[1]:
-                    if df_p82.empty:
-                        st.info("Nenhum conflito futuro detectado para P-82.")
-                    else:
-                        st.warning(f"⚠️ {len(df_p82)} conflito(s) futuro(s) encontrado(s) para P-82.")
-                        st.dataframe(df_p82[cols_sub], use_container_width=True, hide_index=True)
-
-                with subtabs[2]:
-                    if df_p83.empty:
-                        st.info("Nenhum conflito futuro detectado para P-83.")
-                    else:
-                        st.warning(f"⚠️ {len(df_p83)} conflito(s) futuro(s) encontrado(s) para P-83.")
-                        st.dataframe(df_p83[cols_sub], use_container_width=True, hide_index=True)
-
-                if not df_outros.empty:
-                    with subtabs[3]:
-                        st.warning(f"⚠️ {len(df_outros)} conflito(s) futuro(s) em outras bases.")
-                        st.dataframe(df_outros[cols_sub], use_container_width=True, hide_index=True)
-
-        with tab_sugest:
+        with tab_dict["Sugestões"]:
             render_aba_sugestoes()
 
-        with tab_log:
+        with tab_dict["Log de Edições"]:
             render_aba_log_edicoes()
 
-        with tab_equipe:
-            status_rows = display_members.copy()
-            status_rows["Status no período"] = status_rows["Matrícula"].map(
-                lambda m: "Disponível" if str(int(m)) in familiar_available else "Ocupado" if pd.notna(m) else "—"
-            )
-            show_cols = [c for c in [
-                "Nome", "Disciplina", "Função", "Projeto", "E-mail", "Matrícula", "Status no período"
-            ] if c in status_rows.columns]
-            st.dataframe(status_rows[show_cols], use_container_width=True, hide_index=True)
+        if is_editor:
+            if "Equipe" in tab_dict:
+                with tab_dict["Equipe"]:
+                    render_team_tab(display_members, familiar_available)
 
-        with tab_export:
-            st.subheader("Eventos no período")
-            if not events_in_window.empty:
-                st.dataframe(events_in_window, use_container_width=True, hide_index=True)
-            else:
-                st.info("Sem eventos no período.")
-            st.divider()
-            c_exp1, c_exp2, c_exp3 = st.columns(3)
-            if not events_in_window.empty:
-                c_exp1.download_button("📥 Eventos (CSV)", events_in_window.to_csv(index=False).encode("utf-8"), "eventos.csv", "text/csv", use_container_width=True)
-            if not conflicts_df.empty:
-                c_exp2.download_button("📥 Conflitos Futuros (CSV)", conflicts_df.to_csv(index=False).encode("utf-8"), "conflitos_futuros.csv", "text/csv", use_container_width=True)
-            equipe_csv = equipe_filtered.to_csv(index=False).encode("utf-8")
-            c_exp3.download_button("📥 Equipe (CSV)", equipe_csv, "equipe.csv", "text/csv", use_container_width=True)
+            if "📋 Dados Consolidados" in tab_dict:
+                with tab_dict["📋 Dados Consolidados"]:
+                    render_export_tab(events_in_window, conflicts_df, equipe_filtered)
 
 
 if __name__ == "__main__":

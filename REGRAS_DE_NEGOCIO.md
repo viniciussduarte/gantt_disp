@@ -227,6 +227,20 @@ A aba **Log de Edições** oferece rastreabilidade total, gravando de forma cron
 
 ## 12. Registro de Versões
 
+- **v0.3 (Novembro/2026):**
+  - **Modularização Arquitetural do Repositório (gantt_disp):**
+    - Desacoplamento do arquivo monolítico App_Gantt.py em pacotes coesos dentro de src/:
+      - src/config.py: Centralização de constantes, parâmetros de visualização, paleta de cores e presets temporais.
+      - src/schemas.py: Validação de esquemas tabulares, normalização de colunas, datas e matrículas.
+      - src/data_loader.py: Carregamento desacoplado de planilhas locais, Google Drive com integridade binária PK e dados de SQLite com cache @st.cache_data.
+      - src/data_processor.py: Motor analítico de cruzamento de dados, cálculo vetorizado com NumPy de colisões e sobreposições de agenda (detect_conflicts).
+      - src/visualizer.py: Renderização de gráficos de Gantt interativos no Plotly com divisores de disciplina, finais de semana e tooltips.
+      - src/ui_components.py: Componentes modulares Streamlit para sidebar de filtros, cartões de KPIs, abas de conflitos futuros por plataforma, equipe e exportações analíticas.
+    - Manutenção de App_Gantt.py na raiz como entrypoint leve para preservar o deploy no Streamlit Cloud.
+    - Criação de suíte de testes unitários automatizados em 	ests/ (	est_data_loader.py e 	est_conflict_engine.py).
+    - Dependências limpas e flexíveis em 
+equirements.txt.
+
 - **v0.2 (Novembro/2026):**
   - **Janela de Tempo Contínua de 6 Meses:** Substituição da visualização mensal fechada por barra de rolagem horizontal contínua de 6 meses (~182 dias), com banner superior de mês/ano, bordas delimitadoras de virada de mês e botões rápidos de navegação temporal (`⏪ -6 Meses`, `◀ -1 Mês`, `📍 Mês Atual`, `+1 Mês ▶`, `+6 Meses ⏩`).
   - **Regimes de Folga 14x21 vs 14x14 (FSE):** Seleção de projeção de folga (1,5x ou 1,0x) tanto para embarques avulsos quanto cíclicos, persistida no cadastro do colaborador (`p80_membros.regime_folga`). Colaboradores próprios sincronizados recebem 14x21 por padrão.

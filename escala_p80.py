@@ -1343,7 +1343,7 @@ class EscalaP80DB:
         return True
 
 
-# --- INTEGRAÇÃO COM DADOS DO CRONOGRAMA & DETECÇÃO DE CONFLITOS (v0.2) -------
+# --- INTEGRAÇÃO COM DADOS DO CRONOGRAMA & DETECÇÃO DE CONFLITOS (v0.3) -------
 def integrar_escalas_com_cronograma(
     escalas_map: Dict[Tuple[str, str], str],
     mapa_dia_periodo: Dict[Tuple[str, str], Dict],
@@ -2419,7 +2419,7 @@ def build_scala_html(
 </head>
 <body>
     <div class="header-bar">
-        <span>Escala {projeto} — {periodo_rotulo} <small style="font-size:11px;font-weight:normal;opacity:0.85;background:rgba(255,255,255,0.2);padding:2px 6px;border-radius:4px;margin-left:6px;">v0.2</small></span>
+        <span>Escala {projeto} — {periodo_rotulo} <small style="font-size:11px;font-weight:normal;opacity:0.85;background:rgba(255,255,255,0.2);padding:2px 6px;border-radius:4px;margin-left:6px;">v0.3</small></span>
         <span style="font-size:12px;font-weight:normal;opacity:0.95;">
             Equipe Base: <strong>{qtd_nativos}</strong> | Externos: <strong>{qtd_externos}</strong> | Total Linhas: <strong>{total_linhas}</strong>
         </span>
