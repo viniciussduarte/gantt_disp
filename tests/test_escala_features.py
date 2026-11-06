@@ -153,3 +153,4 @@ class TestEscalaFeaturesV03:
         chave = ("P-80", "TESTE COLABORADOR", "2026-10-27", "2026-11-09")
         assert chave in rts
         assert rts[chave] == "RT-TESTE-2026"
+

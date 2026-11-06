@@ -12,18 +12,17 @@ from escala_p80 import (
     render_aba_log_edicoes,
     render_aba_sugestoes,
 )
-from src import (
-    VERSION,
-    Config,
-    DataLoader,
-    DataProcessor,
-    MissingColumnError,
-    Visualizer,
+from src.config import Config, VERSION
+from src.data_loader import DataLoader
+from src.data_processor import DataProcessor
+from src.schemas import MissingColumnError
+from src.visualizer import Visualizer
+from src.ui_components import (
+    inject_sidebar_tab_sync,
     render_conflicts_tab,
     render_export_tab,
     render_kpi_cards,
     render_rt_embarques_tab,
-    inject_sidebar_tab_sync,
     render_sidebar_filters,
     render_team_tab,
 )
