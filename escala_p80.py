@@ -15,6 +15,7 @@ Fornece:
 import calendar
 import math
 import os
+import re
 import sqlite3
 from collections import defaultdict
 from datetime import date, datetime, timedelta
@@ -1427,6 +1428,7 @@ def integrar_escalas_com_cronograma(
       * 'Estaleiro' -> Mapeado para status 'BASE' com observação 'Estaleiro (Cronograma)'
       * 'Férias' / 'Ferias' -> Mapeado para status 'FÉR' com observação 'Férias (Cronograma)'
       * 'Folga' -> Mapeado para status 'FOL' com observação 'Folga (Cronograma)'
+      * 'Embarque' -> Mapeado para status 'EMP' (Emprestado para outra unidade; não pontua nesta plataforma)
     - Regra: NÃO calcula 1,5x de folga para estes eventos do cronograma!
     - Detecção de Conflitos:
       Se em um mesmo dia o colaborador já tiver escala lançada na plataforma (ex: EMB em P-80)
@@ -1511,6 +1513,8 @@ def integrar_escalas_com_cronograma(
             nomes_atuais.add(nome)
 
         # Mapeamento de tipos do cronograma para a grade da escala
+        # Regra: Embarques importados da planilha são mapeados como "Emprestado" (EMP)
+        # para que não contem ao final da lista como embarcado nesta unidade.
         if tipo_raw == "Estaleiro":
             st_crono = "BASE"
             obs_crono = "Estaleiro (Cronograma)"
@@ -1520,10 +1524,10 @@ def integrar_escalas_com_cronograma(
         elif tipo_raw == "Folga":
             st_crono = "FOL"
             obs_crono = "Folga (Cronograma)"
-        elif tipo_raw == "Embarque":
-            st_crono = "EMB"
+        elif tipo_raw in ("Embarque", "Emprestado"):
+            st_crono = "EMP"
             det_val = str(row.get("Detalhamento", "")).strip() if pd.notna(row.get("Detalhamento")) else ""
-            obs_crono = det_val if det_val else "Embarque (Cronograma)"
+            obs_crono = det_val if det_val else f"{tipo_raw} (Cronograma)"
         elif tipo_raw in ("Treinamento", "Workshop", "Visita Técnica", "Visita Tecnica"):
             st_crono = "TREIN"
             det_val = str(row.get("Detalhamento", "")).strip() if pd.notna(row.get("Detalhamento")) else ""
@@ -1531,11 +1535,8 @@ def integrar_escalas_com_cronograma(
         elif tipo_raw in ("Licença", "Licenca"):
             st_crono = "LIC"
             obs_crono = "Licença (Cronograma)"
-        elif tipo_raw in ("Emprestado",):
-            st_crono = "EMP"
-            obs_crono = "Emprestado (Cronograma)"
         else:
-            st_crono = "EMB"
+            st_crono = "EMP"
             obs_crono = f"{tipo_raw} (Cronograma)"
 
         d_ini_ev = max(row["_ini"].date(), dt_ini_mes)
@@ -1553,6 +1554,18 @@ def integrar_escalas_com_cronograma(
 
             st_sqlite = merged_map.get((nome, iso_d))
 
+            dest_proj_crono = "Outra Unidade"
+            if st_crono == "EMP":
+                det_str = str(row.get("Detalhamento", "")).strip() if pd.notna(row.get("Detalhamento")) else ""
+                m_plat = re.search(r'\b(P[- ]?\d{2,3})\b', det_str, re.IGNORECASE) if det_str else None
+                if m_plat:
+                    num_p = re.sub(r'[^0-9]', '', m_plat.group(1))
+                    dest_proj_crono = f"P-{num_p}"
+                elif row_proj and row_proj != "NAN":
+                    dest_proj_crono = normalizar_projeto(row_proj)
+                elif row_plat and row_plat != "NAN" and row_plat != proj_norm:
+                    dest_proj_crono = normalizar_projeto(row_plat)
+
             if st_sqlite is None:
                 # Sem evento prévio na plataforma: plota o evento do cronograma diretamente
                 merged_map[(nome, iso_d)] = st_crono
@@ -1565,7 +1578,9 @@ def integrar_escalas_com_cronograma(
                     "status": st_crono,
                     "dias": (row["_fim"].date() - row["_ini"].date()).days + 1,
                     "observacao": obs_crono,
-                    "origem_cronograma": True
+                    "origem_cronograma": True,
+                    "is_emprestado": (st_crono == "EMP"),
+                    "projeto_destino": dest_proj_crono if st_crono == "EMP" else None
                 }
             elif st_sqlite != st_crono and st_sqlite != "CONF":
                 # Conflito detectado entre escala e cronograma!
@@ -1598,7 +1613,9 @@ def integrar_escalas_com_cronograma(
                     "is_conflito": True,
                     "status_crono": st_crono,
                     "tipo_crono": tipo_raw,
-                    "origem_cronograma": False
+                    "origem_cronograma": False,
+                    "is_emprestado": (st_sqlite == "EMP" or st_crono == "EMP"),
+                    "projeto_destino": dest_proj_crono if (st_sqlite == "EMP" or st_crono == "EMP") else None
                 }
                 lista_conflitos.append({
                     "nome": nome,

@@ -140,6 +140,7 @@ Para atender colaboradores sob diferentes regimes operacionais (incluindo FSE e 
   - Na plataforma $A$ (origem nativa): ele é automaticamente exibido com o status **`EMP` (Emprestado)**.
   - **Soma da Turma a Bordo:** Células com status `EMP` **não pontuam** na soma diária de pessoas a bordo da plataforma de origem $A$ (pois o profissional está fisicamente a bordo na unidade $B$).
   - **Pop-up Informativo:** Ao clicar em qualquer célula `EMP` na unidade de origem, abre-se um modal dedicado informando o nome da plataforma de destino e o período, com botão de atalho para navegar diretamente à escala daquela unidade.
+- **Embarques Importados do Cronograma / Planilha:** Qualquer atividade do tipo "Embarque" oriunda da planilha do cronograma externo (`Planejamento Geral.xlsx`) é importada para a grade com o status **`EMP` (Emprestado)**. Isso garante que embarques realizados em outras unidades não pontuem na contagem diária de efetivo da unidade local e não apareçam na lista de *DIVISÃO DE TURMA A BORDO* ao final da grade.
 
 ### 7.2 Regras do Status de Licença (`LIC`)
 - Status dedicado para afastamentos formais (licença médica, licença paternidade/maternidade, etc.).

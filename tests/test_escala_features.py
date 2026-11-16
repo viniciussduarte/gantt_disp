@@ -20,8 +20,9 @@ from escala_p80 import (
 class TestEscalaFeaturesV03:
     """Validações de regras de negócio introduzidas na v0.3."""
 
-    def test_embarque_tipo_included_in_cronograma(self):
-        """Garante que atividades do tipo 'Embarque' são integradas como status 'EMB'."""
+    def test_embarque_tipo_imported_as_emprestado(self):
+        """Garante que atividades do tipo 'Embarque' da planilha são integradas como status 'EMP' (Emprestado),
+        não contando como embarcado na divisão de turma a bordo desta unidade."""
         df_crono = pd.DataFrame([{
             "Matrícula": "1385894",
             "Nome": "IGOR TEIXEIRA",
@@ -30,7 +31,7 @@ class TestEscalaFeaturesV03:
             "Início": pd.Timestamp("2026-10-27"),
             "Término": pd.Timestamp("2026-10-31"),
             "Plataforma": "P80",
-            "Detalhamento": "Embarque de Teste"
+            "Detalhamento": "Embarque P-76"
         }])
 
         membros = [{
@@ -41,7 +42,7 @@ class TestEscalaFeaturesV03:
             "regime_folga": "14x21"
         }]
 
-        m_map, m_per, m_membros, conflitos, q_ext = integrar_escalas_com_cronograma(
+        m_map, m_per, conflitos, m_membros, q_ext = integrar_escalas_com_cronograma(
             escalas_map={},
             mapa_dia_periodo={},
             membros=membros,
@@ -51,9 +52,32 @@ class TestEscalaFeaturesV03:
             mes=10
         )
 
+        # Deve ser mapeado como EMP (Emprestado)
         assert ("IGOR TEIXEIRA", "2026-10-27") in m_map
-        assert m_map[("IGOR TEIXEIRA", "2026-10-27")] == "EMB"
-        assert m_map[("IGOR TEIXEIRA", "2026-10-31")] == "EMB"
+        assert m_map[("IGOR TEIXEIRA", "2026-10-27")] == "EMP"
+        assert m_map[("IGOR TEIXEIRA", "2026-10-31")] == "EMP"
+
+        # Deve identificar projeto de destino
+        p_obj = m_per[("IGOR TEIXEIRA", "2026-10-27")]
+        assert p_obj["is_emprestado"] is True
+        assert p_obj["projeto_destino"] == "P-76"
+
+        # Valida que na grade HTML o colaborador aparece como EMP e NÃO entra na Turma a Bordo desta plataforma
+        html = build_scala_html(
+            projeto="P-80",
+            ano=2026,
+            mes=10,
+            membros=m_membros,
+            escalas_map=m_map,
+            mapa_dia_periodo=m_per,
+            qtd_nativos=1,
+            qtd_externos=0,
+            is_editor=False
+        )
+        assert "item-emp" in html
+        assert "Emprestado para P-76" in html
+        # Não deve haver embarques na turma a bordo
+        assert "0 profissionais a bordo no período" in html
 
     def test_base_weekend_exclusion(self):
         """Garante que lançamentos de BASE pulam sábados (5) e domingos (6)."""
@@ -77,7 +101,7 @@ class TestEscalaFeaturesV03:
             "regime_folga": "14x21"
         }]
 
-        m_map, m_per, m_membros, conflitos, q_ext = integrar_escalas_com_cronograma(
+        m_map, m_per, conflitos, m_membros, q_ext = integrar_escalas_com_cronograma(
             escalas_map={},
             mapa_dia_periodo={},
             membros=membros,
