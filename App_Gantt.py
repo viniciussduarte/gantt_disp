@@ -57,6 +57,10 @@ class App:
         )
 
         DataLoader.clear_inconsistencias()
+        try:
+            DBManager.init_db()
+        except Exception:
+            pass
 
         # 1. Carregamento prévio da equipe com tratamento fail-fast amigável
         try:
