@@ -402,16 +402,31 @@ class DBManager:
     @classmethod
     def is_cloud(cls) -> bool:
         """Verifica se há conexão ativa com Supabase PostgreSQL."""
+        if cls._conn is None:
+            try:
+                cls.get_connection()
+            except Exception:
+                pass
         return cls._actual_backend == "Supabase (PostgreSQL)"
 
     @classmethod
     def get_backend_name(cls) -> str:
         """Retorna o nome amigável do backend ativo."""
+        if cls._conn is None:
+            try:
+                cls.get_connection()
+            except Exception:
+                pass
         return cls._actual_backend
 
     @classmethod
     def get_diagnostics(cls) -> Dict[str, Any]:
         """Retorna informações diagnósticas do banco de dados para a interface."""
+        if cls._conn is None:
+            try:
+                cls.get_connection()
+            except Exception:
+                pass
         raw_url = get_database_url()
         return {
             "backend": cls._actual_backend,

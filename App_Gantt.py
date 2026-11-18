@@ -49,18 +49,18 @@ class App:
         self.hoje = datetime.today().date()
 
     def run(self):
+        DataLoader.clear_inconsistencias()
+        try:
+            DBManager.init_db()
+        except Exception:
+            pass
+
         st.title(f"🚢 Painel de Disponibilidade e Escalas de Plataforma — {VERSION}")
         backend_name = DBManager.get_backend_name()
         status_icon = "🟢" if DBManager.is_cloud() else "🟠"
         st.caption(
             f"Visualização integrada de Estaleiro, Férias, Planejamento Geral e Escalas P-80, P-82 e P-83 ({VERSION}) — {status_icon} **{backend_name}**."
         )
-
-        DataLoader.clear_inconsistencias()
-        try:
-            DBManager.init_db()
-        except Exception:
-            pass
 
         # 1. Carregamento prévio da equipe com tratamento fail-fast amigável
         try:
