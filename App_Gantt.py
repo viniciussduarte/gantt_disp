@@ -13,6 +13,7 @@ from escala_p80 import (
     render_aba_sugestoes,
 )
 from src.config import Config, VERSION
+from src.database import DBManager
 from src.data_loader import DataLoader
 from src.data_processor import DataProcessor
 from src.schemas import MissingColumnError
@@ -49,8 +50,10 @@ class App:
 
     def run(self):
         st.title(f"🚢 Painel de Disponibilidade e Escalas de Plataforma — {VERSION}")
+        backend_name = DBManager.get_backend_name()
+        status_icon = "🟢" if DBManager.is_cloud() else "🟠"
         st.caption(
-            f"Visualização integrada de Estaleiro, Férias, Planejamento Geral e Escalas P-80, P-82 e P-83 ({VERSION})."
+            f"Visualização integrada de Estaleiro, Férias, Planejamento Geral e Escalas P-80, P-82 e P-83 ({VERSION}) — {status_icon} **{backend_name}**."
         )
 
         DataLoader.clear_inconsistencias()

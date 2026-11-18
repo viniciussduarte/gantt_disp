@@ -204,119 +204,14 @@ class EscalaP80DB:
 
     @staticmethod
     def get_connection():
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        return conn
+        from src.database import DBManager
+        return DBManager.get_connection()
 
     @classmethod
     def init_db(cls):
-        """Inicializa as tabelas com suporte a múltiplos projetos, sugestões e logs de auditoria."""
-        with cls.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS p80_membros (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    nome TEXT UNIQUE NOT NULL,
-                    disciplina TEXT NOT NULL,
-                    funcao TEXT,
-                    projeto TEXT DEFAULT 'P-80',
-                    ativo INTEGER DEFAULT 1,
-                    ordem INTEGER DEFAULT 0
-                )
-            """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS p80_escalas (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    nome TEXT NOT NULL,
-                    disciplina TEXT NOT NULL,
-                    projeto TEXT NOT NULL,
-                    data TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    observacao TEXT,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(nome, projeto, data)
-                )
-            """)
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_escalas_proj_data ON p80_escalas(projeto, data)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_escalas_nome ON p80_escalas(nome)")
-
-            # Tabela de Sugestões de Implementação / Melhorias
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS p80_sugestoes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    autor TEXT NOT NULL,
-                    is_anonimo INTEGER DEFAULT 0,
-                    titulo TEXT NOT NULL,
-                    descricao TEXT NOT NULL,
-                    prioridade TEXT DEFAULT 'Média',
-                    status TEXT DEFAULT 'Pendente',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    implementada_at TEXT
-                )
-            """)
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_sugestoes_status ON p80_sugestoes(status)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_sugestoes_prio ON p80_sugestoes(prioridade)")
-
-            # Tabela de Log de Auditoria & Histórico de Edições
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS p80_audit_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    data_hora TEXT NOT NULL,
-                    usuario TEXT NOT NULL,
-                    acao TEXT NOT NULL,
-                    projeto TEXT DEFAULT 'GERAL',
-                    colaborador TEXT DEFAULT '—',
-                    detalhes TEXT NOT NULL
-                )
-            """)
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_data ON p80_audit_log(data_hora DESC)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_proj ON p80_audit_log(projeto)")
-
-            # Tabela de Configuração de Vagas Mínimas por Ativo (Mecânica, Instrumentação, Elétrica, Total)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS p80_config_vagas (
-                    projeto TEXT PRIMARY KEY,
-                    min_mecanica INTEGER DEFAULT 0,
-                    min_instrumentacao INTEGER DEFAULT 0,
-                    min_eletrica INTEGER DEFAULT 0,
-                    min_total INTEGER DEFAULT 0,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-
-            # Tabela de Gestão de Requisição de Transporte (RT) dos Embarques
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS p80_embarque_rt (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    projeto TEXT NOT NULL,
-                    nome TEXT NOT NULL,
-                    data_inicio TEXT NOT NULL,
-                    data_fim TEXT NOT NULL,
-                    numero_rt TEXT DEFAULT '',
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(projeto, nome, data_inicio, data_fim)
-                )
-            """)
-
-            # Migração: coluna regime_folga em p80_membros ('14x21' ou '14x14')
-            cursor.execute("PRAGMA table_info(p80_membros)")
-            cols_membros = [row["name"] for row in cursor.fetchall()]
-            if "regime_folga" not in cols_membros:
-                cursor.execute("ALTER TABLE p80_membros ADD COLUMN regime_folga TEXT DEFAULT '14x21'")
-
-            # Correção de encoding/acentos nas disciplinas
-            cursor.execute("UPDATE p80_membros SET disciplina = 'Elétrica' WHERE disciplina LIKE '%TRIC%' OR disciplina LIKE '%ELET%'")
-            cursor.execute("UPDATE p80_escalas SET disciplina = 'Elétrica' WHERE disciplina LIKE '%TRIC%' OR disciplina LIKE '%ELET%'")
-            cursor.execute("UPDATE p80_membros SET disciplina = 'Mecânica' WHERE disciplina LIKE '%MEC%'")
-            cursor.execute("UPDATE p80_escalas SET disciplina = 'Mecânica' WHERE disciplina LIKE '%MEC%'")
-            cursor.execute("UPDATE p80_membros SET disciplina = 'Instrumentação' WHERE disciplina LIKE '%INST%'")
-            cursor.execute("UPDATE p80_escalas SET disciplina = 'Instrumentação' WHERE disciplina LIKE '%INST%'")
-
-            cursor.execute("UPDATE p80_escalas SET status = 'EMB' WHERE status = 'E'")
-            # Regra estrita: Não puxa supervisores/coordenadores para escalas de plataforma
-            cursor.execute("UPDATE p80_membros SET ativo = 0 WHERE UPPER(funcao) LIKE '%SUPERVIS%' OR UPPER(funcao) LIKE '%COORD%'")
-            conn.commit()
+        """Inicializa as tabelas com suporte a múltiplos projetos, sugestões e logs de auditoria (Supabase ou SQLite)."""
+        from src.database import DBManager
+        DBManager.init_db()
 
     @classmethod
     def get_regime_colaborador(cls, nome: str) -> str:

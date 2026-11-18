@@ -22,6 +22,7 @@ from .schemas import (
 from .data_loader import DataLoader
 from .data_processor import DataProcessor, classify_conflict_severity
 from .visualizer import Visualizer
+from .database import DBManager, get_database_url
 from .ui_components import (
     render_conflicts_tab,
     render_export_tab,
@@ -53,6 +54,8 @@ __all__ = [
     "DataProcessor",
     "classify_conflict_severity",
     "Visualizer",
+    "DBManager",
+    "get_database_url",
     "render_conflicts_tab",
     "render_export_tab",
     "render_kpi_cards",

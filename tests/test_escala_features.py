@@ -162,19 +162,24 @@ class TestEscalaFeaturesV03:
         assert "FSE · Mecânica" in html
 
     def test_rt_persistence(self):
-        """Valida que números de RT são salvos e consultados corretamente no banco SQLite."""
+        """Valida que números de RT são salvos e consultados corretamente no banco."""
         EscalaP80DB.init_db()
-        ok = EscalaP80DB.salvar_embarque_rt(
-            projeto="P-80",
-            nome="TESTE COLABORADOR",
-            data_inicio="2026-10-27",
-            data_fim="2026-11-09",
-            numero_rt="RT-TESTE-2026"
-        )
-        assert ok is True
+        try:
+            ok = EscalaP80DB.salvar_embarque_rt(
+                projeto="P-80",
+                nome="TESTE COLABORADOR",
+                data_inicio="2026-10-27",
+                data_fim="2026-11-09",
+                numero_rt="RT-TESTE-2026"
+            )
+            assert ok is True
 
-        rts = EscalaP80DB.get_embarque_rts()
-        chave = ("P-80", "TESTE COLABORADOR", "2026-10-27", "2026-11-09")
-        assert chave in rts
-        assert rts[chave] == "RT-TESTE-2026"
+            rts = EscalaP80DB.get_embarque_rts()
+            chave = ("P-80", "TESTE COLABORADOR", "2026-10-27", "2026-11-09")
+            assert chave in rts
+            assert rts[chave] == "RT-TESTE-2026"
+        finally:
+            with EscalaP80DB.get_connection() as conn:
+                conn.cursor().execute("DELETE FROM p80_embarque_rt WHERE nome = ?", ("TESTE COLABORADOR",))
+                conn.commit()
 
