@@ -5,7 +5,7 @@ Configurações, constantes e parâmetros globais da aplicação Gantt & Escalas
 from typing import Dict, List, Optional
 
 
-VERSION = "v0.3"
+VERSION = "v0.3.1"
 
 
 class Config:

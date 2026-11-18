@@ -237,11 +237,12 @@ class EscalaP80DB:
     @classmethod
     def set_regime_colaborador(cls, nome: str, regime: str) -> bool:
         """Atualiza o regime de folga no cadastro do colaborador."""
-        cls.clear_cache()
+        QueryCache.clear_membros()
         reg_final = "14x14" if ("14" in str(regime) and "21" not in str(regime)) else "14x21"
+        nome_norm = nome.strip().upper()
         with cls.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("UPDATE p80_membros SET regime_folga = ? WHERE UPPER(TRIM(nome)) = ?", (reg_final, nome.strip().upper()))
+            cursor.execute("UPDATE p80_membros SET regime_folga = ? WHERE nome = ?", (reg_final, nome_norm))
             conn.commit()
             return cursor.rowcount > 0
 
@@ -258,7 +259,7 @@ class EscalaP80DB:
     @classmethod
     def salvar_embarque_rt(cls, projeto: str, nome: str, data_inicio: str, data_fim: str, numero_rt: str) -> bool:
         """Salva ou atualiza o número de RT para o embarque específico."""
-        cls.clear_cache()
+        QueryCache.clear_rts()
         proj_norm = normalizar_projeto(projeto)
         with cls.get_connection() as conn:
             cursor = conn.cursor()
@@ -281,14 +282,14 @@ class EscalaP80DB:
     @classmethod
     def update_membro(cls, nome: str, disciplina: str, funcao: str, regime_folga: str = "14x21") -> bool:
         """Atualiza disciplina, função e regime de um colaborador existente."""
-        cls.clear_cache()
+        QueryCache.clear_membros()
         with cls.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 UPDATE p80_membros
                 SET disciplina = ?, funcao = ?, regime_folga = ?
-                WHERE UPPER(nome) = UPPER(?)
-            """, (disciplina, funcao, regime_folga, nome.strip()))
+                WHERE nome = ?
+            """, (disciplina, funcao, regime_folga, nome.strip().upper()))
             conn.commit()
         cls.registrar_log(
             acao="EQUIPE",
@@ -327,7 +328,8 @@ class EscalaP80DB:
         min_instrumentacao: Optional[int] = None,
         min_eletrica: Optional[int] = None
     ) -> bool:
-        cls.clear_cache()
+        proj_norm = normalizar_projeto(projeto)
+        QueryCache.clear_vagas(proj_norm)
         if min_mecanica is not None:
             min_mec = min_mecanica
         if min_instrumentacao is not None:
@@ -335,7 +337,6 @@ class EscalaP80DB:
         if min_eletrica is not None:
             min_elet = min_eletrica
         """Salva os parâmetros de vagas mínimas para a plataforma informada."""
-        proj_norm = normalizar_projeto(projeto)
         with cls.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
@@ -357,7 +358,7 @@ class EscalaP80DB:
         if equipe_df is None or equipe_df.empty:
             return 0
 
-        cls.clear_cache()
+        QueryCache.clear_membros()
         disc_map = {
             "MEC": "Mecânica",
             "MECÂNICA": "Mecânica",
@@ -375,36 +376,39 @@ class EscalaP80DB:
             "LIDERANÇA": "Engenharia",
         }
 
-        count = 0
+        records_to_sync = []
+        for _, row in equipe_df.iterrows():
+            nome = str(row.get("Nome", "")).strip().upper()
+            if not nome or nome == "NAN":
+                continue
+            orig_disc = str(row.get("Disciplina", "")).strip().upper()
+            disciplina = disc_map.get(orig_disc, "Engenharia")
+            funcao = str(row.get("Função", "Colaborador")).strip().title()
+            projeto_raw = str(row.get("Projeto", "P-80")).strip()
+            projeto = normalizar_projeto(projeto_raw)
+
+            # Regra: Não puxar supervisores para escalas de plataforma
+            if "SUPERVIS" in funcao.upper() or "COORD" in funcao.upper():
+                continue
+
+            records_to_sync.append((nome, disciplina, funcao, projeto))
+
+        if not records_to_sync:
+            return 0
+
         with cls.get_connection() as conn:
             cursor = conn.cursor()
-            for _, row in equipe_df.iterrows():
-                nome = str(row.get("Nome", "")).strip().upper()
-                if not nome or nome == "NAN":
-                    continue
-                orig_disc = str(row.get("Disciplina", "")).strip().upper()
-                disciplina = disc_map.get(orig_disc, "Engenharia")
-                funcao = str(row.get("Função", "Colaborador")).strip().title()
-                projeto_raw = str(row.get("Projeto", "P-80")).strip()
-                projeto = normalizar_projeto(projeto_raw)
-
-                # Regra: Não puxar supervisores para escalas de plataforma
-                if "SUPERVIS" in funcao.upper() or "COORD" in funcao.upper():
-                    continue
-
-                cursor.execute("""
-                    INSERT INTO p80_membros (nome, disciplina, funcao, projeto, ativo, regime_folga)
-                    VALUES (?, ?, ?, ?, 1, '14x21')
-                    ON CONFLICT(nome) DO UPDATE SET
-                        disciplina = excluded.disciplina,
-                        funcao = excluded.funcao,
-                        projeto = excluded.projeto,
-                        ativo = excluded.ativo
-                """, (nome, disciplina, funcao, projeto))
-                if cursor.rowcount > 0:
-                    count += 1
+            cursor.executemany("""
+                INSERT INTO p80_membros (nome, disciplina, funcao, projeto, ativo, regime_folga)
+                VALUES (?, ?, ?, ?, 1, '14x21')
+                ON CONFLICT(nome) DO UPDATE SET
+                    disciplina = excluded.disciplina,
+                    funcao = excluded.funcao,
+                    projeto = excluded.projeto,
+                    ativo = excluded.ativo
+            """, records_to_sync)
             conn.commit()
-        return count
+            return len(records_to_sync)
 
     @classmethod
     @cached_query(ttl=20.0)
@@ -673,13 +677,19 @@ class EscalaP80DB:
 
         with cls.get_connection() as conn:
             cursor = conn.cursor()
+            rows_to_insert = []
             curr = d_inicio
             while curr <= d_fim:
                 iso_date = curr.strftime("%Y-%m-%d")
                 if st_final == "BASE" and curr.weekday() in (5, 6):
                     curr += timedelta(days=1)
                     continue
-                cursor.execute("""
+                rows_to_insert.append((nome, disciplina, proj_norm, iso_date, st_final, observacao))
+                curr += timedelta(days=1)
+                dias_salvos += 1
+
+            if rows_to_insert:
+                cursor.executemany("""
                     INSERT INTO p80_escalas (nome, disciplina, projeto, data, status, observacao, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     ON CONFLICT(nome, projeto, data) DO UPDATE SET
@@ -687,9 +697,7 @@ class EscalaP80DB:
                         status = excluded.status,
                         observacao = excluded.observacao,
                         updated_at = CURRENT_TIMESTAMP
-                """, (nome, disciplina, proj_norm, iso_date, st_final, observacao))
-                curr += timedelta(days=1)
-                dias_salvos += 1
+                """, rows_to_insert)
 
             if st_final == "EMB":
                 if is_14x14:
@@ -699,10 +707,16 @@ class EscalaP80DB:
                     qtd_folga = math.ceil(total_dias * 1.5)
                     obs_folga_auto = "Projeção automática de folga (14x21 - 1,5x)"
 
+                folgas_to_insert = []
                 curr_folga = d_fim + timedelta(days=1)
                 for _ in range(qtd_folga):
                     iso_folga = curr_folga.strftime("%Y-%m-%d")
-                    cursor.execute("""
+                    folgas_to_insert.append((nome, disciplina, proj_norm, iso_folga, obs_folga_auto))
+                    curr_folga += timedelta(days=1)
+                    dias_folga_projetados += 1
+
+                if folgas_to_insert:
+                    cursor.executemany("""
                         INSERT INTO p80_escalas (nome, disciplina, projeto, data, status, observacao, updated_at)
                         VALUES (?, ?, ?, ?, 'FOL', ?, CURRENT_TIMESTAMP)
                         ON CONFLICT(nome, projeto, data) DO UPDATE SET
@@ -710,11 +724,11 @@ class EscalaP80DB:
                             status = excluded.status,
                             observacao = excluded.observacao,
                             updated_at = CURRENT_TIMESTAMP
-                    """, (nome, disciplina, proj_norm, iso_folga, obs_folga_auto))
-                    curr_folga += timedelta(days=1)
-                    dias_folga_projetados += 1
+                    """, folgas_to_insert)
 
             conn.commit()
+
+        QueryCache.clear_escalas(proj_norm)
 
         if not skip_log:
             cls.registrar_log(
@@ -763,6 +777,8 @@ class EscalaP80DB:
 
         with cls.get_connection() as conn:
             cursor = conn.cursor()
+            emb_rows = []
+            fol_rows = []
             for c_idx in range(qtd_ciclos):
                 c_num = c_idx + 1
                 c_offset_days = c_idx * dias_ciclo
@@ -778,15 +794,7 @@ class EscalaP80DB:
                 curr = emb_ini
                 while curr <= emb_fim:
                     iso_dt = curr.strftime("%Y-%m-%d")
-                    cursor.execute("""
-                        INSERT INTO p80_escalas (nome, disciplina, projeto, data, status, observacao, updated_at)
-                        VALUES (?, ?, ?, ?, 'EMB', ?, CURRENT_TIMESTAMP)
-                        ON CONFLICT(nome, projeto, data) DO UPDATE SET
-                            disciplina = excluded.disciplina,
-                            status = 'EMB',
-                            observacao = excluded.observacao,
-                            updated_at = CURRENT_TIMESTAMP
-                    """, (nome, disciplina, proj_norm, iso_dt, obs_emb))
+                    emb_rows.append((nome, disciplina, proj_norm, iso_dt, obs_emb))
                     curr += timedelta(days=1)
                     total_emb += 1
 
@@ -794,19 +802,35 @@ class EscalaP80DB:
                 curr = fol_ini
                 while curr <= fol_fim:
                     iso_dt = curr.strftime("%Y-%m-%d")
-                    cursor.execute("""
-                        INSERT INTO p80_escalas (nome, disciplina, projeto, data, status, observacao, updated_at)
-                        VALUES (?, ?, ?, ?, 'FOL', ?, CURRENT_TIMESTAMP)
-                        ON CONFLICT(nome, projeto, data) DO UPDATE SET
-                            disciplina = excluded.disciplina,
-                            status = 'FOL',
-                            observacao = excluded.observacao,
-                            updated_at = CURRENT_TIMESTAMP
-                    """, (nome, disciplina, proj_norm, iso_dt, obs_fol))
+                    fol_rows.append((nome, disciplina, proj_norm, iso_dt, obs_fol))
                     curr += timedelta(days=1)
                     total_fol += 1
 
+            if emb_rows:
+                cursor.executemany("""
+                    INSERT INTO p80_escalas (nome, disciplina, projeto, data, status, observacao, updated_at)
+                    VALUES (?, ?, ?, ?, 'EMB', ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(nome, projeto, data) DO UPDATE SET
+                        disciplina = excluded.disciplina,
+                        status = 'EMB',
+                        observacao = excluded.observacao,
+                        updated_at = CURRENT_TIMESTAMP
+                """, emb_rows)
+
+            if fol_rows:
+                cursor.executemany("""
+                    INSERT INTO p80_escalas (nome, disciplina, projeto, data, status, observacao, updated_at)
+                    VALUES (?, ?, ?, ?, 'FOL', ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(nome, projeto, data) DO UPDATE SET
+                        disciplina = excluded.disciplina,
+                        status = 'FOL',
+                        observacao = excluded.observacao,
+                        updated_at = CURRENT_TIMESTAMP
+                """, fol_rows)
+
             conn.commit()
+
+        QueryCache.clear_escalas(proj_norm)
 
         cls.registrar_log(
             acao="INSERÇÃO",
@@ -864,14 +888,14 @@ class EscalaP80DB:
             # 1. Verifica se no intervalo antigo havia status EMB
             cursor.execute("""
                 SELECT COUNT(*) FROM p80_escalas
-                WHERE UPPER(TRIM(nome)) = ? AND UPPER(TRIM(projeto)) = ? AND data >= ? AND data <= ? AND status = 'EMB'
+                WHERE nome = ? AND projeto = ? AND data >= ? AND data <= ? AND status = 'EMB'
             """, (nome, proj_norm, d_ini_ant_str, d_fim_ant_str))
             tinha_emb_antigo = (cursor.fetchone()[0] > 0)
 
             # 2. Remove os dias antigos do período
             cursor.execute("""
                 DELETE FROM p80_escalas
-                WHERE UPPER(TRIM(nome)) = ? AND UPPER(TRIM(projeto)) = ? AND data >= ? AND data <= ?
+                WHERE nome = ? AND projeto = ? AND data >= ? AND data <= ?
             """, (nome, proj_norm, d_ini_ant_str, d_fim_ant_str))
 
             # 3. Se o período antigo continha EMB, remove folgas subsequentes associadas
@@ -883,14 +907,14 @@ class EscalaP80DB:
 
                 cursor.execute("""
                     DELETE FROM p80_escalas
-                    WHERE UPPER(TRIM(nome)) = ? AND UPPER(TRIM(projeto)) = ? AND data >= ? AND data <= ? AND status = 'FOL'
+                    WHERE nome = ? AND projeto = ? AND data >= ? AND data <= ? AND status = 'FOL'
                 """, (nome, proj_norm, f_ini_ant, f_fim_ant))
 
                 if d_fim_novo < d_fim_antigo:
                     f_inter_ini = (d_fim_novo + timedelta(days=1)).strftime("%Y-%m-%d")
                     cursor.execute("""
                         DELETE FROM p80_escalas
-                        WHERE UPPER(TRIM(nome)) = ? AND UPPER(TRIM(projeto)) = ? AND data >= ? AND data <= ? AND status = 'FOL'
+                        WHERE nome = ? AND projeto = ? AND data >= ? AND data <= ? AND status = 'FOL'
                     """, (nome, proj_norm, f_inter_ini, f_fim_ant))
 
             conn.commit()
@@ -907,6 +931,8 @@ class EscalaP80DB:
             regime_folga=regime_folga,
             skip_log=True
         )
+
+        QueryCache.clear_escalas(proj_norm)
 
         cls.registrar_log(
             acao="EDIÇÃO",
@@ -968,10 +994,15 @@ class EscalaP80DB:
             """, (nome, proj_norm, d_orig_ini_str, d_orig_fim_str))
 
             # 2. Grava a nova folga contínua nas datas de destino
+            folgas_auto = []
             curr = destino_ini
             while curr <= destino_fim:
                 iso_dest = curr.strftime("%Y-%m-%d")
-                cursor.execute("""
+                folgas_auto.append((nome, disciplina, proj_norm, iso_dest, obs_padrao))
+                curr += timedelta(days=1)
+
+            if folgas_auto:
+                cursor.executemany("""
                     INSERT INTO p80_escalas (nome, disciplina, projeto, data, status, observacao, updated_at)
                     VALUES (?, ?, ?, ?, 'FOL', ?, CURRENT_TIMESTAMP)
                     ON CONFLICT(nome, projeto, data) DO UPDATE SET
@@ -979,10 +1010,11 @@ class EscalaP80DB:
                         status = excluded.status,
                         observacao = excluded.observacao,
                         updated_at = CURRENT_TIMESTAMP
-                """, (nome, disciplina, proj_norm, iso_dest, obs_padrao))
-                curr += timedelta(days=1)
+                """, folgas_auto)
 
             conn.commit()
+
+        QueryCache.clear_escalas(proj_norm)
 
         cls.registrar_log(
             acao="AUTO-PERMUTA",
@@ -1021,13 +1053,13 @@ class EscalaP80DB:
             # Verifica se no intervalo havia status EMB
             cursor.execute("""
                 SELECT COUNT(*) FROM p80_escalas
-                WHERE UPPER(TRIM(nome)) = ? AND UPPER(TRIM(projeto)) = ? AND data >= ? AND data <= ? AND status = 'EMB'
+                WHERE nome = ? AND projeto = ? AND data >= ? AND data <= ? AND status = 'EMB'
             """, (nome, proj_norm, d_ini_str, d_fim_str))
             tinha_emb = (cursor.fetchone()[0] > 0)
 
             cursor.execute("""
                 DELETE FROM p80_escalas
-                WHERE UPPER(TRIM(nome)) = ? AND UPPER(TRIM(projeto)) = ? AND data >= ? AND data <= ?
+                WHERE nome = ? AND projeto = ? AND data >= ? AND data <= ?
             """, (nome, proj_norm, d_ini_str, d_fim_str))
             removidos += cursor.rowcount
 
@@ -1037,11 +1069,13 @@ class EscalaP80DB:
                 f_fim_str = (d_fim + timedelta(days=qtd_folga + 2)).strftime("%Y-%m-%d")
                 cursor.execute("""
                     DELETE FROM p80_escalas
-                    WHERE UPPER(TRIM(nome)) = ? AND UPPER(TRIM(projeto)) = ? AND data >= ? AND data <= ? AND status = 'FOL'
+                    WHERE nome = ? AND projeto = ? AND data >= ? AND data <= ? AND status = 'FOL'
                 """, (nome, proj_norm, f_ini_str, f_fim_str))
                 removidos += cursor.rowcount
 
             conn.commit()
+
+        QueryCache.clear_escalas(proj_norm)
 
         cls.registrar_log(
             acao="EXCLUSÃO",
@@ -1080,6 +1114,8 @@ class EscalaP80DB:
             removidos = cursor.rowcount
             conn.commit()
 
+        QueryCache.clear_escalas(proj_norm)
+
         alvo = f"colaborador {nome.strip().upper()}" if (nome and nome.strip().upper() != "TODOS") else "toda a unidade"
         cls.registrar_log(
             acao="LIMPEZA",
@@ -1096,6 +1132,7 @@ class EscalaP80DB:
         nome = nome.strip().upper()
         if not nome or not disciplina:
             return False
+        QueryCache.clear_membros()
         proj_norm = normalizar_projeto(projeto)
         with cls.get_connection() as conn:
             cursor = conn.cursor()
@@ -1121,6 +1158,7 @@ class EscalaP80DB:
     @classmethod
     def delete_membro(cls, nome: str) -> bool:
         """Desativa um membro."""
+        QueryCache.clear_membros()
         with cls.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("UPDATE p80_membros SET ativo = 0 WHERE nome = ?", (nome.strip().upper(),))
@@ -1144,7 +1182,7 @@ class EscalaP80DB:
         usuario: Optional[str] = None
     ) -> None:
         """Registra uma ação no histórico de auditoria do sistema."""
-        cls.clear_cache()
+        QueryCache.clear_audit_logs()
         try:
             if not usuario:
                 usuario = get_current_user_name()
@@ -1199,7 +1237,7 @@ class EscalaP80DB:
         descricao: str
     ) -> int:
         """Cria uma nova sugestão com status 'Pendente'."""
-        cls.clear_cache()
+        QueryCache.clear_sugestoes()
         autor_limpo = "Anônimo" if is_anonimo else (autor.strip() if autor and autor.strip() else "Anônimo")
         titulo_limpo = titulo.strip()
         desc_limpa = descricao.strip()
@@ -1273,6 +1311,7 @@ class EscalaP80DB:
     @classmethod
     def avaliar_sugestao(cls, id_sugestao: int, prioridade: str, status: str) -> bool:
         """Aprova ou rejeita uma sugestão e define sua prioridade."""
+        QueryCache.clear_sugestoes()
         prio_norm = prioridade.strip().title()
         if prio_norm not in ("Alta", "Média", "Baixa"):
             prio_norm = "Média"
@@ -1304,6 +1343,7 @@ class EscalaP80DB:
     @classmethod
     def marcar_sugestao_implementada(cls, id_sugestao: int) -> bool:
         """Marca uma sugestão aprovada como Implementada."""
+        QueryCache.clear_sugestoes()
         agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with cls.get_connection() as conn:
             cursor = conn.cursor()
@@ -2138,8 +2178,8 @@ def build_scala_html(
                 f'<div class="cell label"><span>{nome}</span><small style="color:#64748b;font-weight:normal;font-size:9px;">{disc_subtext}{reg_badge}</small>{badge_origem}</div>'
             )
 
-            nome_js = nome.replace("'", "\\'").replace('"', '&quot;')
-            disc_js = m["disciplina"].replace("'", "\\'").replace('"', '&quot;')
+            nome_attr = nome.replace('"', '&quot;')
+            disc_attr = m["disciplina"].replace('"', '&quot;')
 
             for idx_dia, dt in enumerate(lista_dias):
                 iso_dt = dt.strftime("%Y-%m-%d")
@@ -2167,15 +2207,8 @@ def build_scala_html(
                         p_fim_f = periodo_obj["fim"].strftime("%d/%m/%Y") if periodo_obj else dt.strftime("%d/%m/%Y")
                         tooltip = f"Emprestado para {dest_proj} ({p_ini_f} a {p_fim_f}) — Clique para ver detalhes"
                         tooltip_esc = tooltip.replace('"', '&quot;')
-                        dest_proj_js = dest_proj.replace("'", "\\'").replace('"', '&quot;')
-                        cell_content = f"""
-                        <div class="item-compact item-clickable item-emp"
-                             onclick="abrirModalEmprestado('{nome_js}', '{dest_proj_js}', '{p_ini_f}', '{p_fim_f}')"
-                             style="background:{st_info['bg']};color:{st_info['color']};"
-                             title="{tooltip_esc}">
-                            {st_info['codigo']}
-                        </div>
-                        """
+                        dest_proj_attr = dest_proj.replace('"', '&quot;')
+                        cell_content = f'<div class="item-compact item-clickable item-emp" data-nome="{nome_attr}" data-dest="{dest_proj_attr}" data-ini="{p_ini_f}" data-fim="{p_fim_f}" style="background:{st_info["bg"]};color:{st_info["color"]};" title="{tooltip_esc}">{st_info["codigo"]}</div>'
                     elif status == "CONF":
                         desc_conf = obs_val if obs_val else f"Divergência entre Escala {projeto} e Cronograma"
                         tooltip = f"⚠️ CONFLITO em {dt.day:02d}/{dt.month:02d}: {desc_conf}"
@@ -2184,15 +2217,9 @@ def build_scala_html(
                             tooltip += f" | Escala: {periodo_obj['inicio']:%d/%m} a {periodo_obj['fim']:%d/%m} ({p_st_real}) (Clique para editar/excluir)"
                             p_ini_str = periodo_obj["inicio"].strftime("%Y-%m-%d")
                             p_fim_str = periodo_obj["fim"].strftime("%Y-%m-%d")
-                            obs_js = obs_val.replace("'", "\'")
                             tooltip_esc = tooltip.replace('"', '&quot;')
-                            cell_content = f"""
-                            <div class="item-compact item-clickable item-conf"
-                                 onclick="abrirModalEdicao('{nome_js}', '{disc_js}', '{projeto}', '{p_ini_str}', '{p_fim_str}', '{p_st_real}', '{obs_js}', false, '{reg_colab}')"
-                                 title="{tooltip_esc}">
-                                CONF
-                            </div>
-                            """
+                            obs_attr = obs_val.replace('"', '&quot;')
+                            cell_content = f'<div class="item-compact item-clickable item-conf" data-nome="{nome_attr}" data-disc="{disc_attr}" data-proj="{projeto}" data-ini="{p_ini_str}" data-fim="{p_fim_str}" data-st="{p_st_real}" data-obs="{obs_attr}" data-reg="{reg_colab}" title="{tooltip_esc}">CONF</div>'
                         else:
                             tooltip_esc = tooltip.replace('"', '&quot;')
                             cell_content = f'<div class="item-compact item-conf" title="{tooltip_esc}">CONF</div>'
@@ -2205,36 +2232,19 @@ def build_scala_html(
                             if obs_val:
                                 tooltip += f" — {obs_val}"
                             tooltip_esc = tooltip.replace('"', '&quot;')
-                            obs_js = obs_val.replace("'", "\'")
-                            cell_content = f"""
-                            <div class="item-compact item-clickable"
-                                 onclick="abrirModalEdicao('{nome_js}', '{disc_js}', '{projeto}', '{p_ini_str}', '{p_fim_str}', '{p_st}', '{obs_js}', false, '{reg_colab}')"
-                                 style="background:{st_info['bg']};color:{st_info['color']};"
-                                 title="{tooltip_esc}">
-                                {st_info['codigo']}
-                            </div>
-                            """
+                            obs_attr = obs_val.replace('"', '&quot;')
+                            cell_content = f'<div class="item-compact item-clickable" data-nome="{nome_attr}" data-disc="{disc_attr}" data-proj="{projeto}" data-ini="{p_ini_str}" data-fim="{p_fim_str}" data-st="{p_st}" data-obs="{obs_attr}" data-reg="{reg_colab}" style="background:{st_info["bg"]};color:{st_info["color"]};" title="{tooltip_esc}">{st_info["codigo"]}</div>'
                         else:
                             tooltip = f"{nome} em {dt.day:02d}/{dt.month:02d}: {st_info['nome']}"
                             if obs_val:
                                 tooltip += f" ({obs_val})"
                             tooltip_esc = tooltip.replace('"', '&quot;')
-                            cell_content = f"""
-                            <div class="item-compact" style="background:{st_info['bg']};color:{st_info['color']};" title="{tooltip_esc}">
-                                {st_info['codigo']}
-                            </div>
-                            """
+                            cell_content = f'<div class="item-compact" style="background:{st_info["bg"]};color:{st_info["color"]};" title="{tooltip_esc}">{st_info["codigo"]}</div>'
                 else:
                     if is_editor:
                         dt_fim_sugest = (dt + timedelta(days=13)).strftime("%Y-%m-%d")
                         tooltip_vazio = f"Clique para lançar escala para {nome} a partir de {dt.day:02d}/{dt.month:02d}"
-                        cell_content = f"""
-                        <div class="empty-clickable"
-                             onclick="abrirModalEdicao('{nome_js}', '{disc_js}', '{projeto}', '{iso_dt}', '{dt_fim_sugest}', 'EMB', '', true, '{reg_colab}')"
-                             title="{tooltip_vazio}">
-                            —
-                        </div>
-                        """
+                        cell_content = f'<div class="empty-clickable" data-nome="{nome_attr}" data-disc="{disc_attr}" data-proj="{projeto}" data-dt="{iso_dt}" data-fim="{dt_fim_sugest}" data-reg="{reg_colab}" title="{tooltip_vazio}">—</div>'
                     else:
                         cell_content = '<span class="empty-dash">—</span>'
 
@@ -2391,8 +2401,8 @@ def build_scala_html(
             f'<div class="cell label"><span>{nome}</span><small style="color:#64748b;font-weight:normal;font-size:9px;">{disc}</small>{badge_ext}</div>'
         )
 
-        nome_js = nome.replace("'", "\'")
-        disc_js = disc.replace("'", "\'")
+        nome_attr = nome.replace('"', '&quot;')
+        disc_attr = disc.replace('"', '&quot;')
 
         curr_col = 2
         for (b_ini, b_fim) in item["blocos"]:
@@ -2410,19 +2420,21 @@ def build_scala_html(
             if periodo_b:
                 p_ini_modal = periodo_b["inicio"].strftime("%Y-%m-%d")
                 p_fim_modal = periodo_b["fim"].strftime("%Y-%m-%d")
-                obs_modal = (periodo_b.get("observacao") or "").replace("'", "\'")
+                obs_modal = periodo_b.get("observacao") or ""
             else:
                 p_ini_modal = iso_b_ini
                 p_fim_modal = iso_b_fim
                 obs_modal = ""
 
             tooltip_balao = f"{nome} ({disc}) — Embarcado de {dt_b_ini:%d/%m} a {dt_b_fim:%d/%m} ({span_balao} dias)"
-            onclick_balao = f'onclick="abrirModalEdicao(\'{nome_js}\', \'{disc_js}\', \'{projeto}\', \'{p_ini_modal}\', \'{p_fim_modal}\', \'EMB\', \'{obs_modal}\', false, \'{reg_colab}\')"' if is_editor else ""
+            obs_modal_attr = obs_modal.replace('"', '&quot;')
+            data_balao = f'data-nome="{nome_attr}" data-disc="{disc_attr}" data-proj="{projeto}" data-ini="{p_ini_modal}" data-fim="{p_fim_modal}" data-st="EMB" data-obs="{obs_modal_attr}" data-reg="{reg_colab}"' if is_editor else ""
             cursor_balao = "cursor:pointer;" if is_editor else "cursor:default;"
+            cls_balao = "turma-balao turma-clickable" if is_editor else "turma-balao"
 
             grid_cells.append(
-                f'<div class="turma-balao" style="grid-column: {b_ini + 2} / span {span_balao}; background:{bg_balao}; border:1px solid {borda_balao}; color:{text_balao}; {cursor_balao}" '
-                f'{onclick_balao} title="{tooltip_balao}">'
+                f'<div class="{cls_balao}" style="grid-column: {b_ini + 2} / span {span_balao}; background:{bg_balao}; border:1px solid {borda_balao}; color:{text_balao}; {cursor_balao}" '
+                f'{data_balao} title="{tooltip_balao}">'
                 f'<span>⚓ {nome} ({span_balao}d)</span>'
                 f'</div>'
             )
@@ -3054,6 +3066,45 @@ def build_scala_html(
                 if (e.target === empOverlay) fecharModalEmp();
             }});
         }}
+
+        // Delegação global de eventos de clique para células de escala (alta performance e baixo overhead de DOM)
+        document.addEventListener('click', function(e) {{
+            var empTarget = e.target.closest('.item-emp');
+            if (empTarget) {{
+                var nome = empTarget.getAttribute('data-nome') || '';
+                var dest = empTarget.getAttribute('data-dest') || '';
+                var ini = empTarget.getAttribute('data-ini') || '';
+                var fim = empTarget.getAttribute('data-fim') || '';
+                abrirModalEmprestado(nome, dest, ini, fim);
+                return;
+            }}
+
+            var editTarget = e.target.closest('.item-clickable, .turma-clickable');
+            if (editTarget && !editTarget.classList.contains('item-emp')) {{
+                var nome = editTarget.getAttribute('data-nome') || '';
+                var disc = editTarget.getAttribute('data-disc') || '';
+                var proj = editTarget.getAttribute('data-proj') || '{projeto}';
+                var ini = editTarget.getAttribute('data-ini') || '';
+                var fim = editTarget.getAttribute('data-fim') || '';
+                var st = editTarget.getAttribute('data-st') || 'EMB';
+                var obs = editTarget.getAttribute('data-obs') || '';
+                var reg = editTarget.getAttribute('data-reg') || '14x21';
+                abrirModalEdicao(nome, disc, proj, ini, fim, st, obs, false, reg);
+                return;
+            }}
+
+            var emptyTarget = e.target.closest('.empty-clickable');
+            if (emptyTarget) {{
+                var nome = emptyTarget.getAttribute('data-nome') || '';
+                var disc = emptyTarget.getAttribute('data-disc') || '';
+                var proj = emptyTarget.getAttribute('data-proj') || '{projeto}';
+                var dt = emptyTarget.getAttribute('data-dt') || '';
+                var fim = emptyTarget.getAttribute('data-fim') || '';
+                var reg = emptyTarget.getAttribute('data-reg') || '14x21';
+                abrirModalEdicao(nome, disc, proj, dt, fim, 'EMB', '', true, reg);
+                return;
+            }}
+        }});
 
 
 

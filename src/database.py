@@ -194,37 +194,25 @@ class PGCursorWrapper:
 
 
 class PGConnectionWrapper:
-    """Wrapper para conexão PostgreSQL do psycopg2 compatível com pool e context managers."""
+    """Wrapper para conexão PostgreSQL do psycopg2 compatível com interface de conexão do SQLite."""
 
-    def __init__(self, raw_conn, pool_ref=None):
+    def __init__(self, raw_conn, keep_open: bool = True):
         self._conn = raw_conn
-        self._pool_ref = pool_ref
-        self._closed = False
+        self._keep_open = keep_open
 
     def cursor(self):
         return PGCursorWrapper(self._conn.cursor())
 
     def commit(self):
-        if not self._conn.closed:
+        if not self._conn.closed and not getattr(self._conn, "autocommit", False):
             self._conn.commit()
 
     def rollback(self):
-        if not self._conn.closed:
+        if not self._conn.closed and not getattr(self._conn, "autocommit", False):
             self._conn.rollback()
 
     def close(self):
-        if self._closed:
-            return
-        self._closed = True
-        if self._pool_ref is not None:
-            try:
-                self._pool_ref.putconn(self._conn)
-            except Exception:
-                try:
-                    self._conn.close()
-                except Exception:
-                    pass
-        else:
+        if not self._keep_open and not self._conn.closed:
             try:
                 self._conn.close()
             except Exception:
@@ -234,22 +222,24 @@ class PGConnectionWrapper:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        try:
-            if exc_type is not None:
-                self.rollback()
-            else:
-                self.commit()
-        finally:
-            self.close()
+        if not self._conn.closed and not getattr(self._conn, "autocommit", False):
+            try:
+                if exc_type is not None:
+                    self.rollback()
+                else:
+                    self.commit()
+            except Exception:
+                pass
+        self.close()
 
 
 class QueryCache:
-    """Cache em memória para consultas repetitivas de leitura com TTL e invalidação instantânea."""
-    _store: Dict[str, Tuple[Any, float]] = {}
-    DEFAULT_TTL: float = 20.0  # 20 segundos de TTL para consultas de leitura
+    """Cache em memória para consultas repetitivas de leitura com TTL e invalidação granular."""
+    _store: Dict[Any, Tuple[Any, float]] = {}
+    DEFAULT_TTL: float = 30.0  # 30 segundos de TTL para consultas de leitura
 
     @classmethod
-    def get(cls, key: str) -> Optional[Any]:
+    def get(cls, key: Any) -> Optional[Any]:
         if key in cls._store:
             val, expire_at = cls._store[key]
             if time.time() < expire_at:
@@ -258,7 +248,7 @@ class QueryCache:
         return None
 
     @classmethod
-    def set(cls, key: str, val: Any, ttl: Optional[float] = None) -> None:
+    def set(cls, key: Any, val: Any, ttl: Optional[float] = None) -> None:
         expire_at = time.time() + (ttl if ttl is not None else cls.DEFAULT_TTL)
         cls._store[key] = (val, expire_at)
 
@@ -267,8 +257,80 @@ class QueryCache:
         """Limpa todo o cache de consultas."""
         cls._store.clear()
 
+    @classmethod
+    def clear_escalas(cls, projeto: Optional[str] = None) -> None:
+        """Invalida seletivamente o cache de escalas e períodos do projeto (preserva equipe e configs)."""
+        to_del = []
+        for k in list(cls._store.keys()):
+            if isinstance(k, tuple) and len(k) > 0:
+                fn_name = k[0]
+                if fn_name in ("get_escalas_periodo", "get_periodos_agrupados", "get_membros_para_escala"):
+                    if not projeto:
+                        to_del.append(k)
+                    else:
+                        args_str = " ".join(str(a) for a in k[1])
+                        if projeto.upper() in args_str.upper() or "TODOS" in args_str.upper():
+                            to_del.append(k)
+        for k in to_del:
+            cls._store.pop(k, None)
 
-def cached_query(ttl: float = 20.0):
+    @classmethod
+    def clear_membros(cls) -> None:
+        """Invalida o cache de colaboradores e cadastros de equipe."""
+        to_del = [
+            k for k in list(cls._store.keys())
+            if isinstance(k, tuple) and len(k) > 0 and k[0] in ("get_todos_membros", "get_membros_para_escala", "get_regime_colaborador")
+        ]
+        for k in to_del:
+            cls._store.pop(k, None)
+
+    @classmethod
+    def clear_sugestoes(cls) -> None:
+        """Invalida o cache de sugestões de melhoria."""
+        to_del = [
+            k for k in list(cls._store.keys())
+            if isinstance(k, tuple) and len(k) > 0 and k[0] == "get_sugestoes"
+        ]
+        for k in to_del:
+            cls._store.pop(k, None)
+
+    @classmethod
+    def clear_audit_logs(cls) -> None:
+        """Invalida o cache do histórico de auditoria."""
+        to_del = [
+            k for k in list(cls._store.keys())
+            if isinstance(k, tuple) and len(k) > 0 and k[0] == "get_audit_logs"
+        ]
+        for k in to_del:
+            cls._store.pop(k, None)
+
+    @classmethod
+    def clear_rts(cls) -> None:
+        """Invalida o cache de RTs de embarque."""
+        to_del = [
+            k for k in list(cls._store.keys())
+            if isinstance(k, tuple) and len(k) > 0 and k[0] == "get_embarque_rts"
+        ]
+        for k in to_del:
+            cls._store.pop(k, None)
+
+    @classmethod
+    def clear_vagas(cls, projeto: Optional[str] = None) -> None:
+        """Invalida o cache de metas de vagas mínimas."""
+        to_del = []
+        for k in list(cls._store.keys()):
+            if isinstance(k, tuple) and len(k) > 0 and k[0] == "get_config_vagas":
+                if not projeto:
+                    to_del.append(k)
+                else:
+                    args_str = " ".join(str(a) for a in k[1])
+                    if projeto.upper() in args_str.upper():
+                        to_del.append(k)
+        for k in to_del:
+            cls._store.pop(k, None)
+
+
+def cached_query(ttl: float = 30.0):
     """
     Decorador para cache em memória de leituras do banco com TTL e invalidação automática.
     Retorna cópia profunda do resultado para evitar efeitos colaterais de mutação.
@@ -294,12 +356,12 @@ def cached_query(ttl: float = 20.0):
 
 class DBManager:
     """
-    Gerenciador unificado de banco de dados com connection pooling e cache em memória.
-    Conecta automaticamente ao Supabase (PostgreSQL) se a URL estiver configurada;
-    caso contrário, utiliza o banco SQLite local (escala_p80.db).
+    Gerenciador unificado de banco de dados otimizado para nuvem (Supabase PgBouncer).
+    Utiliza conexão persistente direta com autocommit ativado e timeout agressivo,
+    eliminando congelamentos de fila (30s/60s) e garantindo resposta sub-segundo.
     """
-    _pool = None
-    _pool_url: Optional[str] = None
+    _conn = None
+    _conn_url: Optional[str] = None
     _initialized: bool = False
 
     @classmethod
@@ -313,30 +375,13 @@ class DBManager:
         return "Supabase (PostgreSQL)" if cls.is_cloud() else "SQLite (Local)"
 
     @classmethod
-    def _get_pool(cls, db_url: str):
-        """Obtém ou instancia o pool de conexões com PostgreSQL / Supabase."""
-        if cls._pool is not None and cls._pool_url == db_url:
-            return cls._pool
-
-        if cls._pool is not None:
-            try:
-                cls._pool.closeall()
-            except Exception:
-                pass
-            cls._pool = None
-
-        cls._pool = pool.ThreadedConnectionPool(minconn=1, maxconn=10, dsn=db_url)
-        cls._pool_url = db_url
-        return cls._pool
-
-    @classmethod
     def clear_cache(cls) -> None:
-        """Invalida o cache em memória (deve ser chamado após qualquer gravação)."""
+        """Invalida todo o cache em memória."""
         QueryCache.clear()
 
     @classmethod
     def get_connection(cls):
-        """Retorna conexão ativa com o banco configurado (reaproveitando pool para Supabase)."""
+        """Retorna conexão ativa persistente com Supabase (autocommit ativo) ou SQLite local."""
         db_url = get_database_url()
         if HAS_PSYCOPG2 and db_url:
             try:
@@ -344,30 +389,36 @@ class DBManager:
                 if db_url.startswith("postgres://"):
                     db_url = "postgresql://" + db_url[len("postgres://"):]
 
-                p = cls._get_pool(db_url)
-                try:
-                    raw_conn = p.getconn()
-                    if raw_conn.closed:
-                        # Se conexão estava fechada por timeout da nuvem, reseta o pool
-                        p.closeall()
-                        cls._pool = None
-                        p = cls._get_pool(db_url)
-                        raw_conn = p.getconn()
-                    return PGConnectionWrapper(raw_conn, pool_ref=p)
-                except Exception:
-                    # Falha pontual ao retirar conexão; recria pool e tenta mais uma vez
-                    if cls._pool:
+                # Se já temos uma conexão ativa e viva para a mesma URL, reaproveita instantaneamente
+                if cls._conn is not None and cls._conn_url == db_url:
+                    if not cls._conn.closed:
                         try:
-                            cls._pool.closeall()
+                            cls._conn.poll()
+                            return PGConnectionWrapper(cls._conn, keep_open=True)
                         except Exception:
-                            pass
-                        cls._pool = None
-                    p = cls._get_pool(db_url)
-                    raw_conn = p.getconn()
-                    return PGConnectionWrapper(raw_conn, pool_ref=p)
+                            try:
+                                cls._conn.close()
+                            except Exception:
+                                pass
+                            cls._conn = None
+
+                # Abre nova conexão com timeout agressivo de 5s e autocommit=True para PgBouncer
+                cls._conn = psycopg2.connect(
+                    db_url,
+                    connect_timeout=5,
+                    keepalives=1,
+                    keepalives_idle=30,
+                    keepalives_interval=10,
+                    keepalives_count=3
+                )
+                cls._conn.autocommit = True
+                cls._conn_url = db_url
+                return PGConnectionWrapper(cls._conn, keep_open=True)
+
             except Exception as e:
                 # Se falhar a conexão com a nuvem, loga alerta e faz fallback para SQLite
                 print(f"[DBManager] Alerta: Falha ao conectar ao Supabase ({e}). Utilizando SQLite local.")
+                cls._conn = None
 
         # Fallback para SQLite local
         conn = sqlite3.connect(DB_PATH)

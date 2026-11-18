@@ -1,5 +1,5 @@
 """
-Entrypoint da aplicação Streamlit: Painel de Disponibilidade e Escalas de Plataforma (v0.3).
+Entrypoint da aplicação Streamlit: Painel de Disponibilidade e Escalas de Plataforma (v0.3.1).
 """
 
 import warnings

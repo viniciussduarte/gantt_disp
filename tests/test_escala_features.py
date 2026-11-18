@@ -209,3 +209,109 @@ class TestEscalaFeaturesV03:
         EscalaP80DB.set_config_vagas("P-80", min_mec=0, min_inst=0, min_elet=0, min_total=0)
         EscalaP80DB.clear_cache()
 
+    def test_v031_event_delegation_in_html(self):
+        """Valida que o HTML em modo edição utiliza delegação de eventos via data-attributes em vez de inline onclick."""
+        from escala_p80 import build_scala_html
+
+        membros = [{
+            "id": 999,
+            "nome": "MARCELO SILVA",
+            "disciplina": "Mecânica",
+            "funcao": "Técnico",
+            "projeto": "P-80",
+            "ativo": 1,
+            "regime_folga": "14x21"
+        }]
+        escalas_map = {("MARCELO SILVA", "2026-11-01"): "EMB"}
+        mapa_dia_periodo = {
+            ("MARCELO SILVA", "2026-11-01"): {
+                "nome": "MARCELO SILVA",
+                "disciplina": "Mecânica",
+                "inicio": date(2026, 11, 1),
+                "fim": date(2026, 11, 14),
+                "status": "EMB",
+                "dias": 14,
+                "observacao": "Teste"
+            }
+        }
+
+        html = build_scala_html(
+            projeto="P-80",
+            ano=2026,
+            mes=11,
+            membros=membros,
+            escalas_map=escalas_map,
+            mapa_dia_periodo=mapa_dia_periodo,
+            qtd_nativos=1,
+            qtd_externos=0,
+            is_editor=True
+        )
+
+        # Não deve conter inline onclick nos empty-clickable (redução massiva de DOM)
+        assert 'onclick="abrirModalEdicao(' not in html
+        # Deve conter data-attributes para delegação
+        assert 'data-nome="MARCELO SILVA"' in html
+        assert 'data-dt="2026-11-02"' in html
+        # Deve conter o listener delegado no script
+        assert "e.target.closest('.empty-clickable')" in html
+        assert "e.target.closest('.item-clickable, .turma-clickable')" in html
+
+    def test_v031_granular_cache_invalidation(self):
+        """Valida que salvar escalas não apaga o cache de colaboradores (invalidação seletiva)."""
+        from src.database import QueryCache
+
+        EscalaP80DB.clear_cache()
+        # 1. Popula cache de membros e de vagas
+        membros = EscalaP80DB.get_todos_membros()
+        vagas = EscalaP80DB.get_config_vagas("P-80")
+
+        # Verifica que membros estão em cache
+        membro_keys = [k for k in QueryCache._store.keys() if isinstance(k, tuple) and k[0] == "get_todos_membros"]
+        assert len(membro_keys) > 0
+
+        # 2. Exclui período ou limpa escalas de P-80
+        EscalaP80DB.excluir_periodo(
+            nome="NOME INEXISTENTE",
+            projeto="P-80",
+            d_inicio=date(2026, 11, 1),
+            d_fim=date(2026, 11, 5)
+        )
+
+        # O cache de membros deve PERMANECER intacto (evita roundtrips desnecessários à nuvem)
+        assert len([k for k in QueryCache._store.keys() if isinstance(k, tuple) and k[0] == "get_todos_membros"]) > 0
+
+    def test_v031_batch_save_and_fast_delete(self):
+        """Valida salvar escala em lote (executemany) e exclusão rápida por index scan."""
+        EscalaP80DB.init_db()
+        test_nome = "TESTE PERFORMANCE V031"
+        try:
+            d_ini = date(2026, 11, 1)
+            d_fim = date(2026, 11, 14)
+            dias_s, dias_f = EscalaP80DB.salvar_escala_periodo(
+                nome=test_nome,
+                disciplina="Mecânica",
+                projeto="P-80",
+                d_inicio=d_ini,
+                d_fim=d_fim,
+                status="EMB",
+                regime_folga="14x21"
+            )
+            assert dias_s == 14
+            assert dias_f == 21
+
+            # Exclui o período e folgas associadas
+            rem = EscalaP80DB.excluir_periodo(
+                nome=test_nome,
+                projeto="P-80",
+                d_inicio=d_ini,
+                d_fim=d_fim,
+                remover_folgas_subsequentes=True
+            )
+            assert rem == 35  # 14 EMB + 21 FOL
+        finally:
+            with EscalaP80DB.get_connection() as conn:
+                conn.cursor().execute("DELETE FROM p80_escalas WHERE nome = ?", (test_nome,))
+                conn.commit()
+            EscalaP80DB.clear_cache()
+
+
