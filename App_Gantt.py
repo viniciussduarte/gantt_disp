@@ -207,24 +207,19 @@ class App:
             tab_names.extend(["Equipe", "📋 Dados Consolidados"])
 
         # Sincronização e persistência da aba ativa entre navegações e interações
-        req_tab = st.session_state.get("main_tab_selector") or st.session_state.get("active_main_tab") or st.query_params.get("tab")
+        req_tab = st.session_state.get("active_main_tab") or st.query_params.get("tab")
+        default_tab = None
         if req_tab:
             for t in tab_names:
                 if req_tab.lower() in t.lower() or t.lower() in req_tab.lower():
-                    st.session_state["main_tab_selector"] = t
+                    default_tab = t
                     st.session_state["active_main_tab"] = t
                     break
 
-        if "main_tab_selector" not in st.session_state or st.session_state["main_tab_selector"] not in tab_names:
-            st.session_state["main_tab_selector"] = tab_names[0]
+        if not default_tab or default_tab not in tab_names:
+            default_tab = tab_names[0]
 
-        def _on_tab_change():
-            curr = st.session_state.get("main_tab_selector")
-            if curr:
-                st.session_state["active_main_tab"] = curr
-                st.query_params["tab"] = curr
-
-        tabs = st.tabs(tab_names, key="main_tab_selector", on_change=_on_tab_change)
+        tabs = st.tabs(tab_names, default=default_tab)
         tab_dict = {name: tab for name, tab in zip(tab_names, tabs)}
         inject_sidebar_tab_sync()
 

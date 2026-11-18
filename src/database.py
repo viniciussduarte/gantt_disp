@@ -55,44 +55,77 @@ def _get_secrets_from_file() -> Dict[str, Any]:
         return data
 
 
+def _clean_pg_url(val: Any) -> Optional[str]:
+    """Valida e limpa URL de conexão PostgreSQL. Ignora URLs HTTP/REST."""
+    if not val:
+        return None
+    s = str(val).strip()
+    if s.startswith("http://") or s.startswith("https://"):
+        return None
+    return s
+
+
 def get_database_url() -> Optional[str]:
     """
     Recupera a URL de conexão do PostgreSQL (Supabase).
     Procura em:
-    1. st.secrets ("DATABASE_URL", "SUPABASE_DB_URL", "connections.postgresql.url")
+    1. st.secrets ("DATABASE_URL", "SUPABASE_DB_URL", "POSTGRES_URL", "connections.postgresql.url", etc.)
     2. Variáveis de ambiente
     3. Arquivo .streamlit/secrets.toml
     """
+    candidate_keys = (
+        "DATABASE_URL",
+        "SUPABASE_DB_URL",
+        "POSTGRES_URL",
+        "POSTGRESQL_URL",
+        "SUPABASE_POSTGRES_URL",
+        "SUPABASE_CONNECTION_STRING",
+        "DATABASE_URI",
+        "SUPABASE_URL",
+    )
+
     # 1. Streamlit secrets
     try:
         import streamlit as st
         if hasattr(st, "secrets"):
-            if "DATABASE_URL" in st.secrets:
-                return str(st.secrets["DATABASE_URL"]).strip()
-            if "SUPABASE_DB_URL" in st.secrets:
-                return str(st.secrets["SUPABASE_DB_URL"]).strip()
-            if "connections" in st.secrets and "postgresql" in st.secrets["connections"]:
-                pg_conf = st.secrets["connections"]["postgresql"]
-                if isinstance(pg_conf, dict) and "url" in pg_conf:
-                    return str(pg_conf["url"]).strip()
+            for k in candidate_keys:
+                if k in st.secrets:
+                    cleaned = _clean_pg_url(st.secrets[k])
+                    if cleaned:
+                        return cleaned
+            if "connections" in st.secrets:
+                for sub in ("postgresql", "postgres", "supabase"):
+                    if sub in st.secrets["connections"]:
+                        pg_conf = st.secrets["connections"][sub]
+                        if isinstance(pg_conf, dict) and "url" in pg_conf:
+                            cleaned = _clean_pg_url(pg_conf["url"])
+                            if cleaned:
+                                return cleaned
     except Exception:
         pass
 
     # 2. Variáveis de ambiente
-    for key in ("DATABASE_URL", "SUPABASE_DB_URL", "POSTGRES_URL"):
+    for key in candidate_keys:
         val = os.environ.get(key)
-        if val and val.strip():
-            return val.strip()
+        cleaned = _clean_pg_url(val)
+        if cleaned:
+            return cleaned
 
     # 3. Arquivo .streamlit/secrets.toml diretamente
     file_secrets = _get_secrets_from_file()
-    for key in ("DATABASE_URL", "SUPABASE_DB_URL", "POSTGRES_URL"):
+    for key in candidate_keys:
         if key in file_secrets and file_secrets[key]:
-            return str(file_secrets[key]).strip()
+            cleaned = _clean_pg_url(file_secrets[key])
+            if cleaned:
+                return cleaned
     if "connections" in file_secrets and isinstance(file_secrets["connections"], dict):
-        pg_c = file_secrets["connections"].get("postgresql", {})
-        if isinstance(pg_c, dict) and "url" in pg_c:
-            return str(pg_c["url"]).strip()
+        for sub in ("postgresql", "postgres", "supabase"):
+            if sub in file_secrets["connections"]:
+                pg_c = file_secrets["connections"][sub]
+                if isinstance(pg_c, dict) and "url" in pg_c:
+                    cleaned = _clean_pg_url(pg_c["url"])
+                    if cleaned:
+                        return cleaned
 
     return None
 
@@ -363,16 +396,30 @@ class DBManager:
     _conn = None
     _conn_url: Optional[str] = None
     _initialized: bool = False
+    _last_error: Optional[str] = None
+    _actual_backend: str = "SQLite (Local)"
 
     @classmethod
     def is_cloud(cls) -> bool:
-        """Verifica se há configuração ativa para Supabase PostgreSQL."""
-        return HAS_PSYCOPG2 and bool(get_database_url())
+        """Verifica se há conexão ativa com Supabase PostgreSQL."""
+        return cls._actual_backend == "Supabase (PostgreSQL)"
 
     @classmethod
     def get_backend_name(cls) -> str:
         """Retorna o nome amigável do backend ativo."""
-        return "Supabase (PostgreSQL)" if cls.is_cloud() else "SQLite (Local)"
+        return cls._actual_backend
+
+    @classmethod
+    def get_diagnostics(cls) -> Dict[str, Any]:
+        """Retorna informações diagnósticas do banco de dados para a interface."""
+        raw_url = get_database_url()
+        return {
+            "backend": cls._actual_backend,
+            "is_cloud": cls.is_cloud(),
+            "url_configured": bool(raw_url),
+            "has_psycopg2": HAS_PSYCOPG2,
+            "last_error": cls._last_error
+        }
 
     @classmethod
     def clear_cache(cls) -> None:
@@ -394,6 +441,8 @@ class DBManager:
                     if not cls._conn.closed:
                         try:
                             cls._conn.poll()
+                            cls._actual_backend = "Supabase (PostgreSQL)"
+                            cls._last_error = None
                             return PGConnectionWrapper(cls._conn, keep_open=True)
                         except Exception:
                             try:
@@ -413,12 +462,18 @@ class DBManager:
                 )
                 cls._conn.autocommit = True
                 cls._conn_url = db_url
+                cls._actual_backend = "Supabase (PostgreSQL)"
+                cls._last_error = None
                 return PGConnectionWrapper(cls._conn, keep_open=True)
 
             except Exception as e:
                 # Se falhar a conexão com a nuvem, loga alerta e faz fallback para SQLite
+                cls._last_error = str(e)
+                cls._actual_backend = "SQLite (Local)"
                 print(f"[DBManager] Alerta: Falha ao conectar ao Supabase ({e}). Utilizando SQLite local.")
                 cls._conn = None
+        else:
+            cls._actual_backend = "SQLite (Local)"
 
         # Fallback para SQLite local
         conn = sqlite3.connect(DB_PATH)

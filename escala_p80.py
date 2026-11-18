@@ -215,6 +215,16 @@ class EscalaP80DB:
         QueryCache.clear()
 
     @classmethod
+    def get_diagnostics(cls):
+        from src.database import DBManager
+        return DBManager.get_diagnostics()
+
+    @classmethod
+    def get_backend_name(cls):
+        from src.database import DBManager
+        return DBManager.get_backend_name()
+
+    @classmethod
     def init_db(cls):
         """Inicializa as tabelas com suporte a múltiplos projetos, sugestões e logs de auditoria (Supabase ou SQLite)."""
         from src.database import DBManager
@@ -3272,7 +3282,6 @@ def _nav_mudar_meses(pfx_nav: str, delta: int, proj_norm: str = ""):
     st.session_state[f"{pfx_nav}_sel_ano"] = novo_y
     if proj_norm:
         tab_target = f"Escala {proj_norm}"
-        st.session_state["main_tab_selector"] = tab_target
         st.session_state["active_main_tab"] = tab_target
         st.query_params["tab"] = tab_target
 
@@ -3286,7 +3295,6 @@ def _nav_ir_mes_atual(pfx_nav: str, proj_norm: str = ""):
     st.session_state[f"{pfx_nav}_sel_ano"] = hoje.year
     if proj_norm:
         tab_target = f"Escala {proj_norm}"
-        st.session_state["main_tab_selector"] = tab_target
         st.session_state["active_main_tab"] = tab_target
         st.query_params["tab"] = tab_target
 
@@ -3300,7 +3308,6 @@ def _nav_on_change_mes(pfx_nav: str, proj_norm: str = ""):
     st.session_state[f"{pfx_nav}_mes"] = st.session_state[f"{pfx_nav}_sel_mes"]
     if proj_norm:
         tab_target = f"Escala {proj_norm}"
-        st.session_state["main_tab_selector"] = tab_target
         st.session_state["active_main_tab"] = tab_target
         st.query_params["tab"] = tab_target
 
@@ -3310,7 +3317,6 @@ def _nav_on_change_ano(pfx_nav: str, proj_norm: str = ""):
     st.session_state[f"{pfx_nav}_ano"] = st.session_state[f"{pfx_nav}_sel_ano"]
     if proj_norm:
         tab_target = f"Escala {proj_norm}"
-        st.session_state["main_tab_selector"] = tab_target
         st.session_state["active_main_tab"] = tab_target
         st.query_params["tab"] = tab_target
 
@@ -3331,7 +3337,6 @@ def render_aba_escala_projeto(
 
     def _rerun_stay():
         st.session_state["active_main_tab"] = f"Escala {proj_norm}"
-        st.session_state["main_tab_selector"] = f"Escala {proj_norm}"
         st.query_params["tab"] = f"Escala {proj_norm}"
         st.rerun()
 
@@ -3550,10 +3555,23 @@ def render_aba_escala_projeto(
                 _rerun_stay()
 
     with c_status:
+        db_diag = EscalaP80DB.get_diagnostics()
+        if db_diag["is_cloud"]:
+            db_badge = '<span style="background:#dcfce7;color:#166534;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">☁️ Supabase</span>'
+        else:
+            db_badge = '<span style="background:#fef3c7;color:#92400e;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">📁 SQLite Local</span>'
+
         if not is_editor:
             st.markdown(
-                f'<div style="background:#f1f5f9;border:1px solid #cbd5e1;padding:6px 12px;border-radius:6px;font-size:12px;color:#475569;">'
-                f'<span>👤 Modo Visualizador (Apenas consulta)</span>'
+                f'<div style="background:#f1f5f9;border:1px solid #cbd5e1;padding:6px 12px;border-radius:6px;font-size:12px;color:#475569;display:flex;justify-content:space-between;align-items:center;">'
+                f'<span>👤 Modo Visualizador</span>{db_badge}'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+        else:
+            st.markdown(
+                f'<div style="background:#f1f5f9;border:1px solid #cbd5e1;padding:6px 12px;border-radius:6px;font-size:12px;color:#475569;display:flex;justify-content:space-between;align-items:center;">'
+                f'<span>Banco:</span>{db_badge}'
                 f'</div>',
                 unsafe_allow_html=True
             )
@@ -3652,23 +3670,6 @@ def render_aba_escala_projeto(
     total_dias_emb_janela = sum(1 for st_val in escalas_map.values() if st_val in ("EMB", "E"))
     total_dias_fol_janela = sum(1 for st_val in escalas_map.values() if st_val == "FOL")
     total_conflitos_janela = len(lista_conflitos)
-
-    k1, k2, k3, k4, k5, k6 = st.columns(6)
-    k1.metric(f"Equipe Base {proj_norm}", qtd_nativos)
-    k2.metric("Externos Escalados", qtd_externos)
-    k3.metric("Embarcados Hoje", embarcados_hoje)
-    k4.metric("Dias EMB (6 Meses)", total_dias_emb_janela)
-    k5.metric("Folga Projetada (FOL)", total_dias_fol_janela)
-    k6.metric(
-        "Conflitos Detectados",
-        total_conflitos_janela,
-        delta=f"{total_conflitos_janela} alerta(s)" if total_conflitos_janela > 0 else "Nenhum",
-        delta_color="inverse" if total_conflitos_janela > 0 else "normal"
-    )
-
-    if lista_conflitos:
-        with st.expander(f"⚠️ Atenção: {total_conflitos_janela} Conflito(s) Detectado(s) com o Cronograma na Janela de 6 Meses", expanded=False):
-            st.dataframe(pd.DataFrame(lista_conflitos), use_container_width=True, hide_index=True)
 
     # --- PAINEL DO EDITOR ---
     todos_cadastrados = EscalaP80DB.get_todos_membros(apenas_ativos=True)
@@ -4006,6 +4007,26 @@ def render_aba_escala_projeto(
 
     altura_iframe = min(880, max(520, len(membros) * 36 + 180))
     components.html(html_page, height=altura_iframe, scrolling=True)
+
+    # --- ESTATÍSTICAS E RESUMO DA ESCALA (APÓS A GRADE VISUAL DA ESCALA) ---
+    st.divider()
+    st.markdown(f"##### 📌 Estatísticas e Resumo da Escala — {proj_norm}")
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric(f"Equipe Base {proj_norm}", qtd_nativos)
+    k2.metric("Externos Escalados", qtd_externos)
+    k3.metric("Embarcados Hoje", embarcados_hoje)
+    k4.metric("Dias EMB (6 Meses)", total_dias_emb_janela)
+    k5.metric("Folga Projetada (FOL)", total_dias_fol_janela)
+    k6.metric(
+        "Conflitos Detectados",
+        total_conflitos_janela,
+        delta=f"{total_conflitos_janela} alerta(s)" if total_conflitos_janela > 0 else "Nenhum",
+        delta_color="inverse" if total_conflitos_janela > 0 else "normal"
+    )
+
+    if lista_conflitos:
+        with st.expander(f"⚠️ Atenção: {total_conflitos_janela} Conflito(s) Detectado(s) com o Cronograma na Janela de 6 Meses", expanded=False):
+            st.dataframe(pd.DataFrame(lista_conflitos), use_container_width=True, hide_index=True)
 
 
 # Compatibilidade retroativa

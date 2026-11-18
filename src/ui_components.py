@@ -432,6 +432,13 @@ def inject_sidebar_tab_sync() -> None:
 
                 tab.addEventListener('click', function() {
                     var txt = (tab.innerText || tab.textContent || '').trim();
+                    try {
+                        var topWin = window.parent || window;
+                        var url = new URL(topWin.location.href);
+                        url.searchParams.set('tab', txt);
+                        topWin.history.replaceState({}, '', url.toString());
+                    } catch(e) {}
+
                     var isEscala = txt.indexOf('Escala') >= 0 || txt.indexOf('RT') >= 0;
                     var isGantt = txt.indexOf('Gantt') >= 0;
 

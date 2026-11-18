@@ -385,19 +385,19 @@ class TestEscalaFeaturesV03:
 
         st.session_state["p80_mes"] = 11
         st.session_state["p80_ano"] = 2026
-        st.session_state["main_tab_selector"] = "📊 Gráfico de Gantt"
         st.session_state["active_main_tab"] = "📊 Gráfico de Gantt"
+        st.query_params["tab"] = "📊 Gráfico de Gantt"
 
         # Avança 1 mês passando proj_norm="P-80"
         _nav_mudar_meses("p80", 1, "P-80")
         assert st.session_state["p80_mes"] == 12
-        assert st.session_state["main_tab_selector"] == "Escala P-80"
         assert st.session_state["active_main_tab"] == "Escala P-80"
+        assert st.query_params["tab"] == "Escala P-80"
 
         # Pula para mês atual
         _nav_ir_mes_atual("p80", "P-80")
-        assert st.session_state["main_tab_selector"] == "Escala P-80"
         assert st.session_state["active_main_tab"] == "Escala P-80"
+        assert st.query_params["tab"] == "Escala P-80"
 
 
 
