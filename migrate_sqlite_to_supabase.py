@@ -80,7 +80,8 @@ def run_migration(pg_url: str = None):
                     projeto TEXT DEFAULT 'P-80',
                     ativo INTEGER DEFAULT 1,
                     ordem INTEGER DEFAULT 0,
-                    regime_folga TEXT DEFAULT '14x21'
+                    regime_folga TEXT DEFAULT '14x21',
+                    is_extra INTEGER DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS p80_escalas (
                     id SERIAL PRIMARY KEY,
@@ -149,21 +150,22 @@ def run_migration(pg_url: str = None):
         # 2. Migra p80_membros
         print("\n2️⃣ Migrando 'p80_membros'...")
         cur_sq = sqlite_conn.cursor()
-        cur_sq.execute("SELECT nome, disciplina, funcao, projeto, ativo, ordem, regime_folga FROM p80_membros")
+        cur_sq.execute("SELECT nome, disciplina, funcao, projeto, ativo, ordem, regime_folga, COALESCE(is_extra, 0) as is_extra FROM p80_membros")
         membros_rows = cur_sq.fetchall()
         with pg_conn.cursor() as cur:
             for r in membros_rows:
                 cur.execute("""
-                    INSERT INTO p80_membros (nome, disciplina, funcao, projeto, ativo, ordem, regime_folga)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO p80_membros (nome, disciplina, funcao, projeto, ativo, ordem, regime_folga, is_extra)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (nome) DO UPDATE SET
                         disciplina = EXCLUDED.disciplina,
                         funcao = EXCLUDED.funcao,
                         projeto = EXCLUDED.projeto,
                         ativo = EXCLUDED.ativo,
                         ordem = EXCLUDED.ordem,
-                        regime_folga = EXCLUDED.regime_folga
-                """, (r["nome"], r["disciplina"], r["funcao"], r["projeto"], r["ativo"], r["ordem"], r.get("regime_folga", "14x21")))
+                        regime_folga = EXCLUDED.regime_folga,
+                        is_extra = EXCLUDED.is_extra
+                """, (r["nome"], r["disciplina"], r["funcao"], r["projeto"], r["ativo"], r["ordem"], r.get("regime_folga", "14x21"), r["is_extra"]))
         pg_conn.commit()
         print(f"   ✅ {len(membros_rows)} colaboradores migrados.")
 
