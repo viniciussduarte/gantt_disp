@@ -165,7 +165,7 @@ def run_migration(pg_url: str = None):
                         ordem = EXCLUDED.ordem,
                         regime_folga = EXCLUDED.regime_folga,
                         is_extra = EXCLUDED.is_extra
-                """, (r["nome"], r["disciplina"], r["funcao"], r["projeto"], r["ativo"], r["ordem"], r.get("regime_folga", "14x21"), r["is_extra"]))
+                """, (r["nome"], r["disciplina"], r["funcao"], r["projeto"], r["ativo"], r["ordem"], r["regime_folga"] or "14x21", r["is_extra"]))
         pg_conn.commit()
         print(f"   ✅ {len(membros_rows)} colaboradores migrados.")
 
