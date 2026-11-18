@@ -1,5 +1,5 @@
 """
-Entrypoint da aplicação Streamlit: Painel de Disponibilidade e Escalas de Plataforma (v0.3.1).
+Entrypoint da aplicação Streamlit: Painel de Disponibilidade e Escalas de Plataforma (v0.3.2).
 """
 
 import warnings
@@ -176,8 +176,6 @@ class App:
 
         total_conflitos = len(conflicts_df)
 
-        render_kpi_cards(total_filtrados, ativos_hoje, ferias_hoje, total_conflitos)
-
         # 6. Filtragem para visualização do Gantt
         display_members = unique_members.copy()
         if only_available:
@@ -208,19 +206,25 @@ class App:
         if is_editor:
             tab_names.extend(["Equipe", "📋 Dados Consolidados"])
 
-        req_tab = st.query_params.get("tab") or st.session_state.get("active_main_tab")
-        default_tab = None
+        # Sincronização e persistência da aba ativa entre navegações e interações
+        req_tab = st.session_state.get("main_tab_selector") or st.session_state.get("active_main_tab") or st.query_params.get("tab")
         if req_tab:
             for t in tab_names:
                 if req_tab.lower() in t.lower() or t.lower() in req_tab.lower():
-                    default_tab = t
+                    st.session_state["main_tab_selector"] = t
+                    st.session_state["active_main_tab"] = t
                     break
 
-        if default_tab in tab_names:
-            tabs = st.tabs(tab_names, default=default_tab)
-        else:
-            tabs = st.tabs(tab_names)
+        if "main_tab_selector" not in st.session_state or st.session_state["main_tab_selector"] not in tab_names:
+            st.session_state["main_tab_selector"] = tab_names[0]
 
+        def _on_tab_change():
+            curr = st.session_state.get("main_tab_selector")
+            if curr:
+                st.session_state["active_main_tab"] = curr
+                st.query_params["tab"] = curr
+
+        tabs = st.tabs(tab_names, key="main_tab_selector", on_change=_on_tab_change)
         tab_dict = {name: tab for name, tab in zip(tab_names, tabs)}
         inject_sidebar_tab_sync()
 
@@ -249,6 +253,10 @@ class App:
                 st.caption(
                     "Verde = disponível no período | Vermelho = ocupado | Barras vermelhas sobrepostas indicam conflitos."
                 )
+
+                st.divider()
+                st.markdown("##### 📌 Resumo Geral de Disponibilidade & Conflitos")
+                render_kpi_cards(total_filtrados, ativos_hoje, ferias_hoje, total_conflitos)
 
         with tab_dict["Escala P-80"]:
             render_aba_escala_projeto("P-80", equipe_geral_df=equipe_df, cronograma_df=combined_df)

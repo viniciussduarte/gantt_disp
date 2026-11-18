@@ -450,9 +450,14 @@ class DBManager:
                     projeto TEXT DEFAULT 'P-80',
                     ativo INTEGER DEFAULT 1,
                     ordem INTEGER DEFAULT 0,
-                    regime_folga TEXT DEFAULT '14x21'
+                    regime_folga TEXT DEFAULT '14x21',
+                    is_extra INTEGER DEFAULT 0
                 )
             """)
+            try:
+                cursor.execute("ALTER TABLE p80_membros ADD COLUMN is_extra INTEGER DEFAULT 0")
+            except Exception:
+                pass
 
             # 2. Tabela de Escalas de Plataforma
             cursor.execute(f"""
@@ -543,6 +548,17 @@ class DBManager:
 
             cursor.execute("UPDATE p80_escalas SET status = 'EMB' WHERE status = 'E'")
             cursor.execute("UPDATE p80_membros SET ativo = 0 WHERE UPPER(funcao) LIKE '%SUPERVIS%' OR UPPER(funcao) LIKE '%COORD%'")
+
+            # Limpeza de dados de teste (v0.3.2)
+            try:
+                cursor.execute("DELETE FROM p80_membros WHERE UPPER(nome) LIKE 'TURMA_TESTE%' OR UPPER(nome) LIKE '%TESTE%'")
+                cursor.execute("DELETE FROM p80_escalas WHERE UPPER(nome) LIKE 'TURMA_TESTE%' OR UPPER(nome) LIKE '%TESTE%'")
+                cursor.execute("DELETE FROM p80_embarque_rt WHERE UPPER(nome) LIKE 'TURMA_TESTE%' OR UPPER(nome) LIKE '%TESTE%'")
+                cursor.execute("DELETE FROM p80_audit_log WHERE UPPER(projeto) = 'GERAL' OR UPPER(colaborador) LIKE '%TESTE%' OR UPPER(detalhes) LIKE '%TESTE%' OR UPPER(colaborador) LIKE '%CARLOS SILVA%' OR UPPER(colaborador) LIKE '%MARIANA COSTA%'")
+                cursor.execute("DELETE FROM p80_sugestoes WHERE UPPER(autor) LIKE '%CARLOS SILVA%' OR UPPER(autor) LIKE '%MARIANA COSTA%' OR UPPER(titulo) LIKE '%TESTE%'")
+            except Exception as e_clean:
+                print(f"[DBManager] Aviso na limpeza de dados de teste: {e_clean}")
+
             conn.commit()
 
         cls._initialized = True

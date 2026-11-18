@@ -399,13 +399,14 @@ class EscalaP80DB:
         with cls.get_connection() as conn:
             cursor = conn.cursor()
             cursor.executemany("""
-                INSERT INTO p80_membros (nome, disciplina, funcao, projeto, ativo, regime_folga)
-                VALUES (?, ?, ?, ?, 1, '14x21')
+                INSERT INTO p80_membros (nome, disciplina, funcao, projeto, ativo, regime_folga, is_extra)
+                VALUES (?, ?, ?, ?, 1, '14x21', 0)
                 ON CONFLICT(nome) DO UPDATE SET
                     disciplina = excluded.disciplina,
                     funcao = excluded.funcao,
                     projeto = excluded.projeto,
-                    ativo = excluded.ativo
+                    ativo = excluded.ativo,
+                    is_extra = 0
             """, records_to_sync)
             conn.commit()
             return len(records_to_sync)
@@ -416,12 +417,12 @@ class EscalaP80DB:
         """Retorna todos os membros cadastrados na base (por padrão, exclui supervisores para as escalas)."""
         with cls.get_connection() as conn:
             cursor = conn.cursor()
-            query = "SELECT id, nome, disciplina, funcao, projeto, ativo, COALESCE(regime_folga, '14x21') as regime_folga FROM p80_membros WHERE 1=1"
+            query = "SELECT id, nome, disciplina, funcao, projeto, ativo, COALESCE(regime_folga, '14x21') as regime_folga, COALESCE(is_extra, 0) as is_extra FROM p80_membros WHERE 1=1"
             if apenas_ativos:
                 query += " AND ativo = 1"
             if excluir_supervisores:
                 query += " AND UPPER(funcao) NOT LIKE '%SUPERVIS%' AND UPPER(funcao) NOT LIKE '%COORD%'"
-            query += " ORDER BY disciplina, nome"
+            query += " ORDER BY disciplina, is_extra ASC, nome ASC"
             cursor.execute(query)
             return [dict(row) for row in cursor.fetchall()]
 
@@ -465,6 +466,7 @@ class EscalaP80DB:
                 if "SUPERVIS" in m_obj.get("funcao", "").upper() or "COORD" in m_obj.get("funcao", "").upper():
                     continue
                 m_obj["is_externo"] = True
+                m_obj["is_extra"] = 1
                 membros_externos.append(m_obj)
             else:
                 membros_externos.append({
@@ -473,7 +475,8 @@ class EscalaP80DB:
                     "funcao": "Externo",
                     "projeto": "EXTERNO",
                     "ativo": 1,
-                    "is_externo": True
+                    "is_externo": True,
+                    "is_extra": 1
                 })
 
         for m in membros_nativos:
@@ -482,7 +485,11 @@ class EscalaP80DB:
         ordem_disc = {d: i for i, d in enumerate(DISCIPLINAS_PADRAO)}
         membros_combinados = membros_nativos + membros_externos
         membros_combinados.sort(
-            key=lambda x: (ordem_disc.get(x["disciplina"], 99), x["nome"])
+            key=lambda x: (
+                ordem_disc.get(x["disciplina"], 99),
+                1 if (x.get("is_extra") or x.get("is_externo")) else 0,
+                x["nome"]
+            )
         )
 
         return membros_combinados, len(membros_nativos), len(membros_externos)
@@ -1127,8 +1134,8 @@ class EscalaP80DB:
         return removidos
 
     @classmethod
-    def add_membro(cls, nome: str, disciplina: str, funcao: str = "Colaborador", projeto: str = "P-80") -> bool:
-        """Adiciona ou reativa um membro na base."""
+    def add_membro(cls, nome: str, disciplina: str, funcao: str = "Colaborador", projeto: str = "P-80", is_extra: int = 1) -> bool:
+        """Adiciona ou reativa um membro na base (por padrão como novo cadastro extra)."""
         nome = nome.strip().upper()
         if not nome or not disciplina:
             return False
@@ -1137,14 +1144,15 @@ class EscalaP80DB:
         with cls.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO p80_membros (nome, disciplina, funcao, projeto, ativo)
-                VALUES (?, ?, ?, ?, 1)
+                INSERT INTO p80_membros (nome, disciplina, funcao, projeto, ativo, is_extra)
+                VALUES (?, ?, ?, ?, 1, ?)
                 ON CONFLICT(nome) DO UPDATE SET
                     disciplina = excluded.disciplina,
                     funcao = excluded.funcao,
                     projeto = excluded.projeto,
-                    ativo = 1
-            """, (nome, disciplina, funcao, proj_norm))
+                    ativo = 1,
+                    is_extra = excluded.is_extra
+            """, (nome, disciplina, funcao, proj_norm, is_extra))
             conn.commit()
 
         cls.registrar_log(
@@ -1157,18 +1165,27 @@ class EscalaP80DB:
 
     @classmethod
     def delete_membro(cls, nome: str) -> bool:
-        """Desativa um membro."""
+        """Desativa um membro apenas se for novo cadastro (extra). Membros da base oficial não podem ser desativados."""
+        nome_clean = nome.strip().upper()
         QueryCache.clear_membros()
         with cls.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("UPDATE p80_membros SET ativo = 0 WHERE nome = ?", (nome.strip().upper(),))
+            cursor.execute("SELECT id, is_extra FROM p80_membros WHERE UPPER(nome) = ?", (nome_clean,))
+            row = cursor.fetchone()
+            if not row:
+                return False
+            row_dict = dict(row) if hasattr(row, "keys") else {}
+            is_extra_val = row_dict.get("is_extra", row[1] if isinstance(row, (list, tuple)) and len(row) > 1 else 0)
+            if not is_extra_val:
+                return False
+            cursor.execute("UPDATE p80_membros SET ativo = 0 WHERE UPPER(nome) = ?", (nome_clean,))
             conn.commit()
 
         cls.registrar_log(
             acao="EQUIPE",
-            detalhes=f"Desativou colaborador {nome.strip().upper()} da equipe.",
+            detalhes=f"Desativou novo colaborador {nome_clean} da equipe.",
             projeto="GERAL",
-            colaborador=nome.strip().upper()
+            colaborador=nome_clean
         )
         return True
 
@@ -1588,7 +1605,11 @@ def integrar_escalas_com_cronograma(
 
     ordem_disc = {d: i for i, d in enumerate(DISCIPLINAS_PADRAO)}
     membros_atualizados.sort(
-        key=lambda x: (ordem_disc.get(x["disciplina"], 99), x["nome"])
+        key=lambda x: (
+            ordem_disc.get(x["disciplina"], 99),
+            1 if (x.get("is_extra") or x.get("is_externo")) else 0,
+            x["nome"]
+        )
     )
     qtd_ext = sum(1 for m in membros_atualizados if m.get("is_externo"))
 
@@ -1675,6 +1696,9 @@ def build_scala_html(
             if disc not in grupos:
                 grupos[disc] = []
             grupos[disc].append(m)
+
+    for cat_name, lista in grupos.items():
+        lista.sort(key=lambda x: (1 if (x.get("is_extra") or x.get("is_externo")) else 0, x["nome"]))
 
     total_dias = len(lista_dias)
     col_width_dia = 37
@@ -2311,6 +2335,7 @@ def build_scala_html(
             "nome": nome,
             "disciplina": disc,
             "is_externo": m.get("is_externo", False),
+            "is_extra": m.get("is_extra", 0),
             "projeto": m.get("projeto", "Outro"),
             "regime_folga": m.get("regime_folga", "14x21"),
             "blocos": blocos
@@ -2322,7 +2347,14 @@ def build_scala_html(
         if is_eletrica(d): return 3
         return 4
 
-    embarques_turma.sort(key=lambda x: (_ord_disc(x["disciplina"]), x["blocos"][0][0], x["nome"]))
+    embarques_turma.sort(
+        key=lambda x: (
+            _ord_disc(x["disciplina"]),
+            1 if (x.get("is_extra") or x.get("is_externo")) else 0,
+            x["blocos"][0][0],
+            x["nome"]
+        )
+    )
 
     # 1. Cabeçalho da Divisão de Turma a Bordo
     grid_cells.append(
@@ -3225,7 +3257,7 @@ def build_scala_html(
 
 
 # --- CALLBACKS DE NAVEGAÇÃO TEMPORAL (MÊS / ANO / 6 MESES) -------------------
-def _nav_mudar_meses(pfx_nav: str, delta: int):
+def _nav_mudar_meses(pfx_nav: str, delta: int, proj_norm: str = ""):
     """Callback para navegação temporal por delta de meses (+1, -1, +6, -6)."""
     k_m = f"{pfx_nav}_mes"
     k_y = f"{pfx_nav}_ano"
@@ -3238,29 +3270,49 @@ def _nav_mudar_meses(pfx_nav: str, delta: int):
     st.session_state[k_y] = novo_y
     st.session_state[f"{pfx_nav}_sel_mes"] = novo_m
     st.session_state[f"{pfx_nav}_sel_ano"] = novo_y
+    if proj_norm:
+        tab_target = f"Escala {proj_norm}"
+        st.session_state["main_tab_selector"] = tab_target
+        st.session_state["active_main_tab"] = tab_target
+        st.query_params["tab"] = tab_target
 
 
-def _nav_ir_mes_atual(pfx_nav: str):
+def _nav_ir_mes_atual(pfx_nav: str, proj_norm: str = ""):
     """Callback para pular diretamente para o mês atual."""
     hoje = date.today()
     st.session_state[f"{pfx_nav}_mes"] = hoje.month
     st.session_state[f"{pfx_nav}_ano"] = hoje.year
     st.session_state[f"{pfx_nav}_sel_mes"] = hoje.month
     st.session_state[f"{pfx_nav}_sel_ano"] = hoje.year
+    if proj_norm:
+        tab_target = f"Escala {proj_norm}"
+        st.session_state["main_tab_selector"] = tab_target
+        st.session_state["active_main_tab"] = tab_target
+        st.query_params["tab"] = tab_target
 
 
-def _nav_mudar_mes(pfx_nav: str, delta: int):
-    _nav_mudar_meses(pfx_nav, delta)
+def _nav_mudar_mes(pfx_nav: str, delta: int, proj_norm: str = ""):
+    _nav_mudar_meses(pfx_nav, delta, proj_norm)
 
 
-def _nav_on_change_mes(pfx_nav: str):
+def _nav_on_change_mes(pfx_nav: str, proj_norm: str = ""):
     """Callback disparado quando o usuário escolhe um mês diretamente no selectbox."""
     st.session_state[f"{pfx_nav}_mes"] = st.session_state[f"{pfx_nav}_sel_mes"]
+    if proj_norm:
+        tab_target = f"Escala {proj_norm}"
+        st.session_state["main_tab_selector"] = tab_target
+        st.session_state["active_main_tab"] = tab_target
+        st.query_params["tab"] = tab_target
 
 
-def _nav_on_change_ano(pfx_nav: str):
+def _nav_on_change_ano(pfx_nav: str, proj_norm: str = ""):
     """Callback disparado quando o usuário escolhe um ano diretamente no selectbox."""
     st.session_state[f"{pfx_nav}_ano"] = st.session_state[f"{pfx_nav}_sel_ano"]
+    if proj_norm:
+        tab_target = f"Escala {proj_norm}"
+        st.session_state["main_tab_selector"] = tab_target
+        st.session_state["active_main_tab"] = tab_target
+        st.query_params["tab"] = tab_target
 
 
 # --- COMPONENTE PRINCIPAL REUTILIZÁVEL PARA QUALQUER PLATAFORMA -------------
@@ -3276,6 +3328,12 @@ def render_aba_escala_projeto(
 
     proj_norm = normalizar_projeto(projeto_nome)
     pfx = proj_norm.lower().replace("-", "")
+
+    def _rerun_stay():
+        st.session_state["active_main_tab"] = f"Escala {proj_norm}"
+        st.session_state["main_tab_selector"] = f"Escala {proj_norm}"
+        st.query_params["tab"] = f"Escala {proj_norm}"
+        st.rerun()
 
     # Processa ações submetidas pelo Pop-up Modal da Grade (Salvar / Excluir / Auto-Permuta)
     params = st.query_params
@@ -3424,10 +3482,7 @@ def render_aba_escala_projeto(
                 else:
                     st.info(f"Nenhum registro da escala própria encontrado para excluir em {proj_norm} ({nome_act} de {d_ini_del:%d/%m/%Y} a {d_fim_del:%d/%m/%Y}). Se o item for originário do cronograma geral (Excel), os ajustes devem ser feitos na planilha fonte.")
 
-            st.session_state["active_main_tab"] = f"Escala {proj_norm}"
-            st.query_params.clear()
-            st.query_params["tab"] = f"Escala {proj_norm}"
-            st.rerun()
+            _rerun_stay()
 
         except Exception as e:
             st.error(f"Erro ao processar alteração na escala: {e}")
@@ -3475,7 +3530,7 @@ def render_aba_escala_projeto(
             with c_ed2:
                 if st.button("🔒 Sair da Edição", key=f"{pfx}_btn_logout", use_container_width=True):
                     st.session_state["escala_is_editor"] = False
-                    st.rerun()
+                    _rerun_stay()
         else:
             with st.popover(f"🔑 Acessar Modo Edição ({proj_norm})"):
                 senha = st.text_input("Senha de administrador:", type="password", key=f"{pfx}_pwd_input")
@@ -3483,7 +3538,7 @@ def render_aba_escala_projeto(
                     if senha == "admin":
                         st.session_state["escala_is_editor"] = True
                         st.success("Modo Edição ativado!")
-                        st.rerun()
+                        _rerun_stay()
                     else:
                         st.error("Senha incorreta.")
 
@@ -3492,7 +3547,7 @@ def render_aba_escala_projeto(
             if st.button("🔄 Sincronizar", key=f"{pfx}_btn_sync", help="Importa colaboradores das planilhas"):
                 qtd = EscalaP80DB.sync_membros_from_equipe(equipe_geral_df)
                 st.toast(f"{qtd} novos colaboradores sincronizados!", icon="✅")
-                st.rerun()
+                _rerun_stay()
 
     with c_status:
         if not is_editor:
@@ -3509,19 +3564,19 @@ def render_aba_escala_projeto(
     c_n1, c_n2, c_n3, c_n4, c_n5, c_n6, c_n7, c_n8, c_n9 = st.columns([1, 0.9, 1.1, 0.9, 1, 1.6, 1.2, 1.3, 3])
 
     with c_n1:
-        st.button("⏪ -6 Meses", use_container_width=True, key=f"{pfx}_p6m", on_click=_nav_mudar_meses, args=(pfx, -6), help="Retrocede 6 meses na janela contínua")
+        st.button("⏪ -6 Meses", use_container_width=True, key=f"{pfx}_p6m", on_click=_nav_mudar_meses, args=(pfx, -6, proj_norm), help="Retrocede 6 meses na janela contínua")
     with c_n2:
-        st.button("◀ -1 Mês", use_container_width=True, key=f"{pfx}_p1m", on_click=_nav_mudar_meses, args=(pfx, -1), help="Retrocede 1 mês")
+        st.button("◀ -1 Mês", use_container_width=True, key=f"{pfx}_p1m", on_click=_nav_mudar_meses, args=(pfx, -1, proj_norm), help="Retrocede 1 mês")
     with c_n3:
-        st.button("📍 Mês Atual", use_container_width=True, key=f"{pfx}_p_today", on_click=_nav_ir_mes_atual, args=(pfx,), help="Retorna imediatamente ao mês atual")
+        st.button("📍 Mês Atual", use_container_width=True, key=f"{pfx}_p_today", on_click=_nav_ir_mes_atual, args=(pfx, proj_norm), help="Retorna imediatamente ao mês atual")
     with c_n4:
-        st.button("+1 Mês ▶", use_container_width=True, key=f"{pfx}_n1m", on_click=_nav_mudar_meses, args=(pfx, 1), help="Avança 1 mês")
+        st.button("+1 Mês ▶", use_container_width=True, key=f"{pfx}_n1m", on_click=_nav_mudar_meses, args=(pfx, 1, proj_norm), help="Avança 1 mês")
     with c_n5:
-        st.button("+6 Meses ⏩", use_container_width=True, key=f"{pfx}_n6m", on_click=_nav_mudar_meses, args=(pfx, 6), help="Avança 6 meses na janela contínua")
+        st.button("+6 Meses ⏩", use_container_width=True, key=f"{pfx}_n6m", on_click=_nav_mudar_meses, args=(pfx, 6, proj_norm), help="Avança 6 meses na janela contínua")
     with c_n6:
-        st.selectbox("Mês Inicial", range(1, 13), format_func=lambda m: f"{m:02d} - {MESES_PT[m-1]}", label_visibility="collapsed", key=key_sel_mes, on_change=_nav_on_change_mes, args=(pfx,))
+        st.selectbox("Mês Inicial", range(1, 13), format_func=lambda m: f"{m:02d} - {MESES_PT[m-1]}", label_visibility="collapsed", key=key_sel_mes, on_change=_nav_on_change_mes, args=(pfx, proj_norm))
     with c_n7:
-        st.selectbox("Ano Inicial", list(range(2024, 2031)), label_visibility="collapsed", key=key_sel_ano, on_change=_nav_on_change_ano, args=(pfx,))
+        st.selectbox("Ano Inicial", list(range(2024, 2031)), label_visibility="collapsed", key=key_sel_ano, on_change=_nav_on_change_ano, args=(pfx, proj_norm))
     with c_n8:
         config_vagas = EscalaP80DB.get_config_vagas(proj_norm)
         with st.popover("⚙️ Vagas Mín.", use_container_width=True):
@@ -3534,7 +3589,7 @@ def render_aba_escala_projeto(
             if st.button("💾 Salvar Parâmetros", key=f"{pfx}_btn_save_cfg_vagas", type="primary", use_container_width=True):
                 EscalaP80DB.set_config_vagas(proj_norm, int(cfg_m), int(cfg_i), int(cfg_e), int(cfg_t))
                 st.toast("Parâmetros de vagas mínimas atualizados com sucesso!", icon="✅")
-                st.rerun()
+                _rerun_stay()
     with c_n9:
         filtro_pesquisa = st.text_input("Buscar", placeholder=f"Filtrar colaborador ou disciplina em {proj_norm}...", label_visibility="collapsed", key=f"{pfx}_filter_input")
 
@@ -3617,6 +3672,7 @@ def render_aba_escala_projeto(
 
     # --- PAINEL DO EDITOR ---
     todos_cadastrados = EscalaP80DB.get_todos_membros(apenas_ativos=True)
+    todos_cadastrados.sort(key=lambda x: (1 if x.get("is_extra") else 0, x["nome"]))
 
     if is_editor:
         with st.expander(f"🛠️ Painel de Operações do Editor — Escala {proj_norm}", expanded=False):
@@ -3748,7 +3804,7 @@ def render_aba_escala_projeto(
                             if dias_f > 0:
                                 msg += f" Projeção automática gerada ({sel_regime}): {dias_f} dias de folga ('FOL')."
                             st.success(msg)
-                        st.rerun()
+                        _rerun_stay()
 
             # 2. Editar Períodos Existentes
             with tab_edit_per:
@@ -3799,7 +3855,7 @@ def render_aba_escala_projeto(
                                 regime_folga=reg_colab_ed
                             )
                             st.success("Período atualizado com sucesso!")
-                            st.rerun()
+                            _rerun_stay()
 
                     with c_act2:
                         if st.button("🗑️ Excluir este Período", key=f"{pfx}_btn_del_per", use_container_width=True):
@@ -3810,7 +3866,7 @@ def render_aba_escala_projeto(
                                 d_fim=p_selecionado["fim"]
                             )
                             st.warning("Período excluído!")
-                            st.rerun()
+                            _rerun_stay()
 
             # 3. Gerenciar Membros
             with tab_membros:
@@ -3833,7 +3889,7 @@ def render_aba_escala_projeto(
                             EscalaP80DB.add_membro(novo_nome, nova_disc, nova_func, proj_norm)
                             EscalaP80DB.set_regime_colaborador(novo_nome, novo_reg)
                             st.success(f"{novo_nome} adicionado à equipe {proj_norm} ({novo_reg})!")
-                            st.rerun()
+                            _rerun_stay()
                         else:
                             st.error("Informe o nome.")
 
@@ -3864,22 +3920,26 @@ def render_aba_escala_projeto(
                         if st.button("💾 Atualizar", key=f"{pfx}_btn_update_membro"):
                             EscalaP80DB.update_membro(membro_edit, edit_disc, edit_func, cur_reg)
                             st.success(f"{membro_edit} atualizado: {edit_disc} | {edit_func}!")
-                            st.rerun()
+                            _rerun_stay()
 
                 st.divider()
                 st.markdown(f"###### Desativar Colaborador da Equipe {proj_norm}")
-                membros_locais = [m["nome"] for m in membros if not m.get("is_externo")]
-                if membros_locais:
+                membros_removiveis = [m["nome"] for m in membros if not m.get("is_externo") and m.get("is_extra") == 1]
+                if not membros_removiveis:
+                    st.info("ℹ️ Não há novos colaboradores cadastrados manualmente nesta unidade para desativação. Funcionários da equipe oficial/base não podem ser desativados pelo painel (ajustes devem ser feitos na planilha fonte).")
+                else:
                     cdel1, cdel2 = st.columns([4, 2])
                     with cdel1:
-                        membro_remover = st.selectbox("Selecione o profissional para remover", membros_locais, key=f"{pfx}_sel_del_m")
+                        membro_remover = st.selectbox("Selecione o novo colaborador para desativar", membros_removiveis, key=f"{pfx}_sel_del_m")
                     with cdel2:
                         st.write("")
                         st.write("")
                         if st.button("🗑️ Desativar Profissional", key=f"{pfx}_btn_del_membro"):
-                            EscalaP80DB.delete_membro(membro_remover)
-                            st.warning(f"{membro_remover} desativado.")
-                            st.rerun()
+                            if EscalaP80DB.delete_membro(membro_remover):
+                                st.warning(f"{membro_remover} desativado.")
+                                _rerun_stay()
+                            else:
+                                st.error(f"Não foi possível desativar {membro_remover}.")
 
             # 4. Limpar Escalas
             with tab_limpar:
@@ -3910,7 +3970,7 @@ def render_aba_escala_projeto(
                                 nome=colab_sel
                             )
                             st.success(f"{qtd_rem} escalas de {colab_sel} removidas com sucesso!")
-                            st.rerun()
+                            _rerun_stay()
 
                 else:
                     _, dias_mes_ini = calendar.monthrange(ano_atual, mes_atual)
@@ -3924,7 +3984,7 @@ def render_aba_escala_projeto(
                             nome="TODOS"
                         )
                         st.success(f"Todas as escalas do mês foram limpas! ({qtd_rem} registros apagados).")
-                        st.rerun()
+                        _rerun_stay()
 
     # --- GRADE VISUAL MATRICIAL DE 6 MESES (RENDERIZADA VIA IFRAME) ---
     st.subheader(f"📅 Escala {proj_norm} — Janela Contínua de 6 Meses ({meses_info[0]['nome']}/{meses_info[0]['ano']} a {meses_info[-1]['nome']}/{meses_info[-1]['ano']})")

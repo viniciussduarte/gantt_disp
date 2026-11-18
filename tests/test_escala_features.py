@@ -314,4 +314,90 @@ class TestEscalaFeaturesV03:
                 conn.commit()
             EscalaP80DB.clear_cache()
 
+    def test_v032_extra_collaborator_sorting_and_delete_protection(self):
+        """Valida que membros base (is_extra=0) não podem ser desativados e que extras (is_extra=1) ordenam ao final."""
+        import pandas as pd
+        from escala_p80 import EscalaP80DB, build_scala_html
+
+        EscalaP80DB.init_db()
+
+        # 1. Simula sincronização de equipe oficial (base: is_extra = 0)
+        df_base = pd.DataFrame([
+            {"Nome": "ZULMIRA BASE", "Disciplina": "Mecânica", "Função": "Técnico", "Projeto": "P-80"},
+            {"Nome": "ALBERTO BASE", "Disciplina": "Mecânica", "Função": "Técnico", "Projeto": "P-80"}
+        ])
+        EscalaP80DB.sync_membros_from_equipe(df_base)
+
+        # 2. Cadastra novo colaborador manual (extra: is_extra = 1)
+        EscalaP80DB.add_membro("ANA EXTRA", "Mecânica", "Técnico", "P-80", is_extra=1)
+        EscalaP80DB.add_membro("BERNARDO EXTRA", "Mecânica", "Técnico", "P-80", is_extra=1)
+
+        try:
+            # 3. Testa proteção de exclusão: Base NÃO pode ser desativado
+            res_del_base = EscalaP80DB.delete_membro("ALBERTO BASE")
+            assert res_del_base is False, "Colaborador da base oficial não deve poder ser desativado!"
+
+            # 4. Testa exclusão de novo cadastro (extra): Deve ser permitido
+            res_del_extra = EscalaP80DB.delete_membro("ANA EXTRA")
+            assert res_del_extra is True, "Novo cadastro manual (extra) deve poder ser desativado."
+
+            # 5. Testa ordenação na grade: não-extras primeiro em ordem alfabética, depois extras em ordem alfabética
+            membros_teste = [
+                {"nome": "ZULMIRA BASE", "disciplina": "Mecânica", "is_extra": 0, "is_externo": False},
+                {"nome": "ALBERTO BASE", "disciplina": "Mecânica", "is_extra": 0, "is_externo": False},
+                {"nome": "BERNARDO EXTRA", "disciplina": "Mecânica", "is_extra": 1, "is_externo": False},
+                {"nome": "CAIO EXTRA", "disciplina": "Mecânica", "is_extra": 1, "is_externo": False},
+            ]
+
+            html = build_scala_html(
+                projeto="P-80",
+                ano=2026,
+                mes=11,
+                membros=membros_teste,
+                escalas_map={},
+                mapa_dia_periodo={},
+                qtd_nativos=4,
+                qtd_externos=0,
+                is_editor=False
+            )
+
+            # Na renderização, ALBERTO BASE deve aparecer antes de ZULMIRA BASE,
+            # e ambos da base devem aparecer antes de BERNARDO EXTRA e CAIO EXTRA
+            pos_alberto = html.find("ALBERTO BASE")
+            pos_zulmira = html.find("ZULMIRA BASE")
+            pos_bernardo = html.find("BERNARDO EXTRA")
+            pos_caio = html.find("CAIO EXTRA")
+
+            assert pos_alberto != -1 and pos_zulmira != -1 and pos_bernardo != -1 and pos_caio != -1
+            assert pos_alberto < pos_zulmira < pos_bernardo < pos_caio
+
+        finally:
+            with EscalaP80DB.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM p80_membros WHERE nome IN ('ZULMIRA BASE', 'ALBERTO BASE', 'ANA EXTRA', 'BERNARDO EXTRA', 'CAIO EXTRA')")
+                conn.commit()
+            EscalaP80DB.clear_cache()
+
+    def test_v032_tab_retention_navigation_callbacks(self):
+        """Valida que os callbacks de navegação por mês retêm a aba de escala ativa."""
+        import streamlit as st
+        from escala_p80 import _nav_mudar_meses, _nav_ir_mes_atual, _nav_on_change_mes
+
+        st.session_state["p80_mes"] = 11
+        st.session_state["p80_ano"] = 2026
+        st.session_state["main_tab_selector"] = "📊 Gráfico de Gantt"
+        st.session_state["active_main_tab"] = "📊 Gráfico de Gantt"
+
+        # Avança 1 mês passando proj_norm="P-80"
+        _nav_mudar_meses("p80", 1, "P-80")
+        assert st.session_state["p80_mes"] == 12
+        assert st.session_state["main_tab_selector"] == "Escala P-80"
+        assert st.session_state["active_main_tab"] == "Escala P-80"
+
+        # Pula para mês atual
+        _nav_ir_mes_atual("p80", "P-80")
+        assert st.session_state["main_tab_selector"] == "Escala P-80"
+        assert st.session_state["active_main_tab"] == "Escala P-80"
+
+
 
