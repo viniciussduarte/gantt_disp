@@ -26,6 +26,8 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
+from src.database import QueryCache, cached_query
+
 
 # --- CONFIGURAÇÕES E CONSTANTES ---------------------------------------------
 DB_PATH = Path(__file__).parent / "escala_p80.db"
@@ -208,12 +210,18 @@ class EscalaP80DB:
         return DBManager.get_connection()
 
     @classmethod
+    def clear_cache(cls):
+        """Invalida o cache em memória das consultas de leitura do banco."""
+        QueryCache.clear()
+
+    @classmethod
     def init_db(cls):
         """Inicializa as tabelas com suporte a múltiplos projetos, sugestões e logs de auditoria (Supabase ou SQLite)."""
         from src.database import DBManager
         DBManager.init_db()
 
     @classmethod
+    @cached_query(ttl=20.0)
     def get_regime_colaborador(cls, nome: str) -> str:
         """Retorna o regime de folga configurado no cadastro do colaborador ('14x21' ou '14x14')."""
         with cls.get_connection() as conn:
@@ -229,6 +237,7 @@ class EscalaP80DB:
     @classmethod
     def set_regime_colaborador(cls, nome: str, regime: str) -> bool:
         """Atualiza o regime de folga no cadastro do colaborador."""
+        cls.clear_cache()
         reg_final = "14x14" if ("14" in str(regime) and "21" not in str(regime)) else "14x21"
         with cls.get_connection() as conn:
             cursor = conn.cursor()
@@ -237,6 +246,7 @@ class EscalaP80DB:
             return cursor.rowcount > 0
 
     @classmethod
+    @cached_query(ttl=20.0)
     def get_embarque_rts(cls) -> Dict[Tuple[str, str, str, str], str]:
         """Retorna mapeamento {(projeto, nome, data_inicio, data_fim): numero_rt}."""
         with cls.get_connection() as conn:
@@ -248,6 +258,7 @@ class EscalaP80DB:
     @classmethod
     def salvar_embarque_rt(cls, projeto: str, nome: str, data_inicio: str, data_fim: str, numero_rt: str) -> bool:
         """Salva ou atualiza o número de RT para o embarque específico."""
+        cls.clear_cache()
         proj_norm = normalizar_projeto(projeto)
         with cls.get_connection() as conn:
             cursor = conn.cursor()
@@ -270,6 +281,7 @@ class EscalaP80DB:
     @classmethod
     def update_membro(cls, nome: str, disciplina: str, funcao: str, regime_folga: str = "14x21") -> bool:
         """Atualiza disciplina, função e regime de um colaborador existente."""
+        cls.clear_cache()
         with cls.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
@@ -286,6 +298,7 @@ class EscalaP80DB:
         return True
 
     @classmethod
+    @cached_query(ttl=20.0)
     def get_config_vagas(cls, projeto: str) -> Dict[str, int]:
         """Obtém os parâmetros de vagas mínimas da plataforma."""
         proj_norm = normalizar_projeto(projeto)
@@ -314,6 +327,7 @@ class EscalaP80DB:
         min_instrumentacao: Optional[int] = None,
         min_eletrica: Optional[int] = None
     ) -> bool:
+        cls.clear_cache()
         if min_mecanica is not None:
             min_mec = min_mecanica
         if min_instrumentacao is not None:
@@ -343,6 +357,7 @@ class EscalaP80DB:
         if equipe_df is None or equipe_df.empty:
             return 0
 
+        cls.clear_cache()
         disc_map = {
             "MEC": "Mecânica",
             "MECÂNICA": "Mecânica",
@@ -392,6 +407,7 @@ class EscalaP80DB:
         return count
 
     @classmethod
+    @cached_query(ttl=20.0)
     def get_todos_membros(cls, apenas_ativos: bool = True, excluir_supervisores: bool = True) -> List[Dict]:
         """Retorna todos os membros cadastrados na base (por padrão, exclui supervisores para as escalas)."""
         with cls.get_connection() as conn:
@@ -406,6 +422,7 @@ class EscalaP80DB:
             return [dict(row) for row in cursor.fetchall()]
 
     @classmethod
+    @cached_query(ttl=20.0)
     def get_membros_para_escala(
         cls,
         projeto: str,
@@ -467,6 +484,7 @@ class EscalaP80DB:
         return membros_combinados, len(membros_nativos), len(membros_externos)
 
     @classmethod
+    @cached_query(ttl=20.0)
     def get_escalas_periodo(
         cls,
         projeto: str,
@@ -512,6 +530,7 @@ class EscalaP80DB:
         return result
 
     @classmethod
+    @cached_query(ttl=20.0)
     def get_periodos_agrupados(cls, projeto: str) -> Tuple[List[Dict], Dict[Tuple[str, str], Dict]]:
         """
         Retorna:
@@ -1125,6 +1144,7 @@ class EscalaP80DB:
         usuario: Optional[str] = None
     ) -> None:
         """Registra uma ação no histórico de auditoria do sistema."""
+        cls.clear_cache()
         try:
             if not usuario:
                 usuario = get_current_user_name()
@@ -1141,6 +1161,7 @@ class EscalaP80DB:
             print(f"Erro ao registrar audit log: {e}")
 
     @classmethod
+    @cached_query(ttl=20.0)
     def get_audit_logs(
         cls,
         limite: int = 500,
@@ -1178,6 +1199,7 @@ class EscalaP80DB:
         descricao: str
     ) -> int:
         """Cria uma nova sugestão com status 'Pendente'."""
+        cls.clear_cache()
         autor_limpo = "Anônimo" if is_anonimo else (autor.strip() if autor and autor.strip() else "Anônimo")
         titulo_limpo = titulo.strip()
         desc_limpa = descricao.strip()
@@ -1201,6 +1223,7 @@ class EscalaP80DB:
         return sug_id
 
     @classmethod
+    @cached_query(ttl=20.0)
     def get_sugestoes(cls, status_filtro: Optional[str] = None) -> List[Dict]:
         """
         Retorna sugestões cadastradas.

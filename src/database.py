@@ -3,9 +3,12 @@ Módulo de conexão e gerenciamento de banco de dados híbrido (Supabase Postgre
 Garante persistência permanente na nuvem no Streamlit Cloud com fallback automático para SQLite.
 """
 
+import copy
+import functools
 import os
 import re
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -191,40 +194,113 @@ class PGCursorWrapper:
 
 
 class PGConnectionWrapper:
-    """Wrapper para conexão PostgreSQL do psycopg2 compatível com interface de conexão do SQLite."""
+    """Wrapper para conexão PostgreSQL do psycopg2 compatível com pool e context managers."""
 
-    def __init__(self, raw_conn):
+    def __init__(self, raw_conn, pool_ref=None):
         self._conn = raw_conn
+        self._pool_ref = pool_ref
+        self._closed = False
 
     def cursor(self):
         return PGCursorWrapper(self._conn.cursor())
 
     def commit(self):
-        self._conn.commit()
+        if not self._conn.closed:
+            self._conn.commit()
 
     def rollback(self):
-        self._conn.rollback()
+        if not self._conn.closed:
+            self._conn.rollback()
 
     def close(self):
-        self._conn.close()
+        if self._closed:
+            return
+        self._closed = True
+        if self._pool_ref is not None:
+            try:
+                self._pool_ref.putconn(self._conn)
+            except Exception:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+        else:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if exc_type is not None:
-            self._conn.rollback()
-        else:
-            self._conn.commit()
-        self._conn.close()
+        try:
+            if exc_type is not None:
+                self.rollback()
+            else:
+                self.commit()
+        finally:
+            self.close()
+
+
+class QueryCache:
+    """Cache em memória para consultas repetitivas de leitura com TTL e invalidação instantânea."""
+    _store: Dict[str, Tuple[Any, float]] = {}
+    DEFAULT_TTL: float = 20.0  # 20 segundos de TTL para consultas de leitura
+
+    @classmethod
+    def get(cls, key: str) -> Optional[Any]:
+        if key in cls._store:
+            val, expire_at = cls._store[key]
+            if time.time() < expire_at:
+                return val
+            del cls._store[key]
+        return None
+
+    @classmethod
+    def set(cls, key: str, val: Any, ttl: Optional[float] = None) -> None:
+        expire_at = time.time() + (ttl if ttl is not None else cls.DEFAULT_TTL)
+        cls._store[key] = (val, expire_at)
+
+    @classmethod
+    def clear(cls) -> None:
+        """Limpa todo o cache de consultas."""
+        cls._store.clear()
+
+
+def cached_query(ttl: float = 20.0):
+    """
+    Decorador para cache em memória de leituras do banco com TTL e invalidação automática.
+    Retorna cópia profunda do resultado para evitar efeitos colaterais de mutação.
+    """
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            # Normaliza argumentos ignorando o objeto de classe (cls)
+            clean_args = tuple(a for a in args if not isinstance(a, type))
+            kw_items = tuple(sorted((k, str(v)) for k, v in kwargs.items()))
+            key = (fn.__name__, clean_args, kw_items)
+
+            cached = QueryCache.get(key)
+            if cached is not None:
+                return copy.deepcopy(cached)
+
+            result = fn(*args, **kwargs)
+            QueryCache.set(key, result, ttl=ttl)
+            return copy.deepcopy(result)
+        return wrapper
+    return decorator
 
 
 class DBManager:
     """
-    Gerenciador unificado de banco de dados.
+    Gerenciador unificado de banco de dados com connection pooling e cache em memória.
     Conecta automaticamente ao Supabase (PostgreSQL) se a URL estiver configurada;
     caso contrário, utiliza o banco SQLite local (escala_p80.db).
     """
+    _pool = None
+    _pool_url: Optional[str] = None
+    _initialized: bool = False
 
     @classmethod
     def is_cloud(cls) -> bool:
@@ -237,16 +313,58 @@ class DBManager:
         return "Supabase (PostgreSQL)" if cls.is_cloud() else "SQLite (Local)"
 
     @classmethod
+    def _get_pool(cls, db_url: str):
+        """Obtém ou instancia o pool de conexões com PostgreSQL / Supabase."""
+        if cls._pool is not None and cls._pool_url == db_url:
+            return cls._pool
+
+        if cls._pool is not None:
+            try:
+                cls._pool.closeall()
+            except Exception:
+                pass
+            cls._pool = None
+
+        cls._pool = pool.ThreadedConnectionPool(minconn=1, maxconn=10, dsn=db_url)
+        cls._pool_url = db_url
+        return cls._pool
+
+    @classmethod
+    def clear_cache(cls) -> None:
+        """Invalida o cache em memória (deve ser chamado após qualquer gravação)."""
+        QueryCache.clear()
+
+    @classmethod
     def get_connection(cls):
-        """Retorna conexão ativa com o banco configurado (Supabase ou SQLite local)."""
+        """Retorna conexão ativa com o banco configurado (reaproveitando pool para Supabase)."""
         db_url = get_database_url()
         if HAS_PSYCOPG2 and db_url:
             try:
                 # Normaliza esquema postgres:// para postgresql:// se necessário
                 if db_url.startswith("postgres://"):
                     db_url = "postgresql://" + db_url[len("postgres://"):]
-                raw_conn = psycopg2.connect(db_url)
-                return PGConnectionWrapper(raw_conn)
+
+                p = cls._get_pool(db_url)
+                try:
+                    raw_conn = p.getconn()
+                    if raw_conn.closed:
+                        # Se conexão estava fechada por timeout da nuvem, reseta o pool
+                        p.closeall()
+                        cls._pool = None
+                        p = cls._get_pool(db_url)
+                        raw_conn = p.getconn()
+                    return PGConnectionWrapper(raw_conn, pool_ref=p)
+                except Exception:
+                    # Falha pontual ao retirar conexão; recria pool e tenta mais uma vez
+                    if cls._pool:
+                        try:
+                            cls._pool.closeall()
+                        except Exception:
+                            pass
+                        cls._pool = None
+                    p = cls._get_pool(db_url)
+                    raw_conn = p.getconn()
+                    return PGConnectionWrapper(raw_conn, pool_ref=p)
             except Exception as e:
                 # Se falhar a conexão com a nuvem, loga alerta e faz fallback para SQLite
                 print(f"[DBManager] Alerta: Falha ao conectar ao Supabase ({e}). Utilizando SQLite local.")
@@ -257,8 +375,13 @@ class DBManager:
         return conn
 
     @classmethod
-    def init_db(cls):
-        """Cria e atualiza o esquema em PostgreSQL ou SQLite."""
+    def init_db(cls, force: bool = False):
+        """
+        Cria e atualiza o esquema em PostgreSQL ou SQLite.
+        Executado apenas uma vez por inicialização da aplicação para evitar sobrecarga de DDL.
+        """
+        if cls._initialized and not force:
+            return
         is_pg = cls.is_cloud()
 
         with cls.get_connection() as conn:
@@ -370,3 +493,5 @@ class DBManager:
             cursor.execute("UPDATE p80_escalas SET status = 'EMB' WHERE status = 'E'")
             cursor.execute("UPDATE p80_membros SET ativo = 0 WHERE UPPER(funcao) LIKE '%SUPERVIS%' OR UPPER(funcao) LIKE '%COORD%'")
             conn.commit()
+
+        cls._initialized = True

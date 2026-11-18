@@ -22,7 +22,7 @@ from .schemas import (
 from .data_loader import DataLoader
 from .data_processor import DataProcessor, classify_conflict_severity
 from .visualizer import Visualizer
-from .database import DBManager, get_database_url
+from .database import DBManager, get_database_url, QueryCache, cached_query
 from .ui_components import (
     render_conflicts_tab,
     render_export_tab,

@@ -182,4 +182,30 @@ class TestEscalaFeaturesV03:
             with EscalaP80DB.get_connection() as conn:
                 conn.cursor().execute("DELETE FROM p80_embarque_rt WHERE nome = ?", ("TESTE COLABORADOR",))
                 conn.commit()
+            EscalaP80DB.clear_cache()
+
+    def test_query_cache_and_invalidation(self):
+        """Valida que o cache em memória acelera leituras e é invalidado automaticamente em alterações."""
+        from src.database import DBManager, QueryCache
+
+        EscalaP80DB.clear_cache()
+        # 1. Primeira leitura popula o cache
+        vagas1 = EscalaP80DB.get_config_vagas("P-80")
+        assert vagas1 is not None
+
+        # 2. Verifica se a chave foi armazenada no cache
+        assert len(QueryCache._store) > 0
+
+        # 3. Alteração invalida o cache automaticamente
+        EscalaP80DB.set_config_vagas("P-80", min_mec=5, min_inst=3, min_elet=2, min_total=10)
+        assert len(QueryCache._store) == 0
+
+        # 4. Nova leitura traz os dados atualizados
+        vagas2 = EscalaP80DB.get_config_vagas("P-80")
+        assert vagas2["min_mecanica"] == 5
+        assert vagas2["min_instrumentacao"] == 3
+
+        # Limpeza para deixar o banco como antes
+        EscalaP80DB.set_config_vagas("P-80", min_mec=0, min_inst=0, min_elet=0, min_total=0)
+        EscalaP80DB.clear_cache()
 
