@@ -488,11 +488,9 @@ class DBManager:
         """
         if cls._initialized and not force:
             return
-        is_pg = cls.is_cloud()
-
         with cls.get_connection() as conn:
             cursor = conn.cursor()
-
+            is_pg = isinstance(conn, PGConnectionWrapper) or cls.is_cloud()
             id_col = "id SERIAL PRIMARY KEY" if is_pg else "id INTEGER PRIMARY KEY AUTOINCREMENT"
 
             # 1. Tabela de Membros da Equipe
