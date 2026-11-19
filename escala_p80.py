@@ -3557,9 +3557,9 @@ def render_aba_escala_projeto(
     with c_status:
         db_diag = EscalaP80DB.get_diagnostics()
         if db_diag["is_cloud"]:
-            db_badge = '<span style="background:#dcfce7;color:#166534;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">☁️ Supabase</span>'
+            db_badge = '<span style="background:#dcfce7;color:#166534;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">☁️ Banco Online</span>'
         else:
-            db_badge = '<span style="background:#fef3c7;color:#92400e;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">📁 SQLite Local</span>'
+            db_badge = '<span style="background:#fef3c7;color:#92400e;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">📁 Banco Offline</span>'
 
         if not is_editor:
             st.markdown(

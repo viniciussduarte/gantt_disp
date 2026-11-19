@@ -415,40 +415,79 @@ class DBManager:
     _conn_url: Optional[str] = None
     _initialized: bool = False
     _last_error: Optional[str] = None
-    _actual_backend: str = "SQLite (Local)"
+    _actual_backend: str = "Banco Offline"
 
     @classmethod
     def is_cloud(cls) -> bool:
-        """Verifica se há conexão ativa com Supabase PostgreSQL."""
+        """
+        Verifica ativamente se há conexão real e funcional com o Banco Online (PostgreSQL / Supabase).
+        Executa um round-trip query de validação ('SELECT 1') para confirmar a comunicação de fato no servidor.
+        """
         if cls._conn is None:
             try:
                 cls.get_connection()
             except Exception:
                 pass
-        return cls._actual_backend == "Supabase (PostgreSQL)"
+        if cls._conn is not None and not getattr(cls._conn, "closed", True):
+            try:
+                with cls._conn.cursor() as cur:
+                    cur.execute("SELECT 1;")
+                cls._actual_backend = "Banco Online"
+                return True
+            except Exception as e:
+                cls._last_error = f"Perda de conexão com o banco online: {e}"
+                try:
+                    cls._conn.close()
+                except Exception:
+                    pass
+                cls._conn = None
+                cls._actual_backend = "Banco Offline"
+                return False
+        return False
 
     @classmethod
     def get_backend_name(cls) -> str:
-        """Retorna o nome amigável do backend ativo."""
-        if cls._conn is None:
+        """Retorna 'Banco Online' se houver conexão ativa e validada com o PostgreSQL, ou 'Banco Offline' (SQLite)."""
+        return "Banco Online" if cls.is_cloud() else "Banco Offline"
+
+    @classmethod
+    def verify_online_status(cls) -> Dict[str, Any]:
+        """
+        Executa verificação profunda com query ativa no PostgreSQL remoto,
+        medindo latência e capturando versão real do servidor.
+        """
+        t0 = time.time()
+        is_online = cls.is_cloud()
+        latency_ms = (time.time() - t0) * 1000
+        server_version = None
+        current_db = None
+        if is_online and cls._conn:
             try:
-                cls.get_connection()
+                with cls._conn.cursor() as cur:
+                    cur.execute("SELECT current_database(), version();")
+                    row = cur.fetchone()
+                    if row:
+                        current_db = row[0]
+                        server_version = row[1].split()[0] + " " + row[1].split()[1]
             except Exception:
                 pass
-        return cls._actual_backend
+        return {
+            "is_online": is_online,
+            "backend": "Banco Online" if is_online else "Banco Offline",
+            "latency_ms": round(latency_ms, 1),
+            "current_database": current_db,
+            "server_version": server_version,
+            "last_error": cls._last_error
+        }
 
     @classmethod
     def get_diagnostics(cls) -> Dict[str, Any]:
         """Retorna informações diagnósticas do banco de dados para a interface."""
-        if cls._conn is None:
-            try:
-                cls.get_connection()
-            except Exception:
-                pass
+        is_online = cls.is_cloud()
         raw_url = get_database_url()
         return {
-            "backend": cls._actual_backend,
-            "is_cloud": cls.is_cloud(),
+            "backend": "Banco Online" if is_online else "Banco Offline",
+            "is_cloud": is_online,
             "url_configured": bool(raw_url),
             "has_psycopg2": HAS_PSYCOPG2,
             "last_error": cls._last_error
@@ -461,7 +500,7 @@ class DBManager:
 
     @classmethod
     def get_connection(cls):
-        """Retorna conexão ativa persistente com Supabase (autocommit ativo) ou SQLite local."""
+        """Retorna conexão ativa persistente com Banco Online (autocommit ativo) ou Banco Offline (SQLite)."""
         db_url = get_database_url()
         if HAS_PSYCOPG2 and db_url:
             try:
@@ -473,8 +512,9 @@ class DBManager:
                 if cls._conn is not None and cls._conn_url == db_url:
                     if not cls._conn.closed:
                         try:
-                            cls._conn.poll()
-                            cls._actual_backend = "Supabase (PostgreSQL)"
+                            with cls._conn.cursor() as cur:
+                                cur.execute("SELECT 1;")
+                            cls._actual_backend = "Banco Online"
                             cls._last_error = None
                             return PGConnectionWrapper(cls._conn, keep_open=True)
                         except Exception:
@@ -518,25 +558,28 @@ class DBManager:
                             pass
 
                 if conn_obj is not None:
+                    conn_obj.autocommit = True
+                    # Executa consulta de teste real para validar conexão antes de definir como Banco Online
+                    with conn_obj.cursor() as cur:
+                        cur.execute("SELECT 1;")
                     cls._conn = conn_obj
-                    cls._conn.autocommit = True
                     cls._conn_url = db_url
-                    cls._actual_backend = "Supabase (PostgreSQL)"
+                    cls._actual_backend = "Banco Online"
                     cls._last_error = None
                     return PGConnectionWrapper(cls._conn, keep_open=True)
                 elif connect_err:
                     raise connect_err
 
             except Exception as e:
-                # Se falhar a conexão com a nuvem, loga alerta e faz fallback para SQLite
+                # Se falhar a conexão com a nuvem, loga alerta e faz fallback para Banco Offline
                 cls._last_error = str(e)
-                cls._actual_backend = "SQLite (Local)"
-                print(f"[DBManager] Alerta: Falha ao conectar ao Supabase ({e}). Utilizando SQLite local.")
+                cls._actual_backend = "Banco Offline"
+                print(f"[DBManager] Alerta: Falha ao conectar ao Banco Online ({e}). Utilizando Banco Offline.")
                 cls._conn = None
         else:
-            cls._actual_backend = "SQLite (Local)"
+            cls._actual_backend = "Banco Offline"
 
-        # Fallback para SQLite local
+        # Fallback para Banco Offline (SQLite local)
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         return conn

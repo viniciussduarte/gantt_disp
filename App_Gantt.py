@@ -1,5 +1,5 @@
 """
-Entrypoint da aplicação Streamlit: Painel de Disponibilidade e Escalas de Plataforma (v0.3.2).
+Entrypoint da aplicação Streamlit: Painel de Disponibilidade e Escalas de Plataforma (v0.3.3).
 """
 
 import warnings
@@ -65,11 +65,11 @@ class App:
         if not DBManager.is_cloud():
             diag = DBManager.get_diagnostics()
             err_msg = diag.get("last_error")
-            with st.expander("ℹ️ Informações de Conexão com o Banco de Dados (Modo SQLite Local)", expanded=False):
+            with st.expander("ℹ️ Informações de Conexão: Banco Offline", expanded=False):
                 st.warning(
-                    "**A aplicação está operando com SQLite Local.**\n\n"
+                    "**A aplicação está operando em modo Banco Offline.**\n\n"
                     + (f"**Diagnóstico de conexão:** `{err_msg}`\n\n" if err_msg else "")
-                    + "Para sincronizar com o **Supabase PostgreSQL** na nuvem (Streamlit Community Cloud):\n"
+                    + "Para conectar ao **Banco Online** na nuvem (Streamlit Community Cloud):\n"
                     "1. No painel do Streamlit Cloud, vá em **Settings** -> **Secrets**.\n"
                     "2. Configure a variável `DATABASE_URL` utilizando o **Connection Pooler IPv4**:\n"
                     "```toml\n"
