@@ -2758,6 +2758,19 @@ def build_scala_html(
         function submeterModal() {{
             var form = document.getElementById('modalForm');
             if (!form) return;
+
+            // Feedback visual e desabilitação para evitar múltiplos cliques ou travamentos visuais
+            if (btnSalvar) {{
+                btnSalvar.disabled = true;
+                btnSalvar.style.opacity = '0.6';
+                btnSalvar.innerText = '⏳ Processando...';
+            }}
+            if (btnExcluir) {{
+                btnExcluir.disabled = true;
+                btnExcluir.style.opacity = '0.6';
+                btnExcluir.innerText = '⏳ Excluindo...';
+            }}
+
             var formData = new FormData(form);
 
             try {{
@@ -3259,6 +3272,15 @@ def build_scala_html(
                 submeterModal();
             }}
         }}
+
+        // Limpa parâmetros de ação da URL do navegador pai (evita que o navegador retenha p80_act ao recarregar)
+        try {{
+            var topWin = window.parent || window;
+            if (topWin.location.search && topWin.location.search.indexOf('p80_act=') >= 0) {{
+                var cleanUrl = (topWin.location.origin || '') + (topWin.location.pathname || '/') + '?tab=' + encodeURIComponent('Escala {projeto}');
+                topWin.history.replaceState({{}}, topWin.document.title, cleanUrl);
+            }}
+        }} catch(e) {{}}
     </script>
 </body>
 </html>
@@ -3337,15 +3359,32 @@ def render_aba_escala_projeto(
 
     def _rerun_stay():
         st.session_state["active_main_tab"] = f"Escala {proj_norm}"
+        # Limpa completamente qualquer parâmetro de ação residual da URL do Streamlit
+        for k in list(st.query_params.keys()):
+            if k != "tab":
+                try:
+                    del st.query_params[k]
+                except Exception:
+                    pass
         st.query_params["tab"] = f"Escala {proj_norm}"
         st.rerun()
 
     # Processa ações submetidas pelo Pop-up Modal da Grade (Salvar / Excluir / Auto-Permuta)
-    params = st.query_params
+    params = dict(st.query_params)
     act = params.get("p80_act")
     act_proj = params.get("p80_proj")
 
     if act and (act_proj == proj_norm or normalizar_projeto(act_proj) == proj_norm):
+        # 1. Limpa imediatamente todos os parâmetros de ação da URL ativa do Streamlit
+        # Isso impede que um refresh ou rerun posterior tente re-executar a mesma ação (ex: exclusão dupla)
+        for k in list(st.query_params.keys()):
+            if k.startswith("p80_") or k.startswith("ap_"):
+                try:
+                    del st.query_params[k]
+                except Exception:
+                    pass
+        st.query_params["tab"] = f"Escala {proj_norm}"
+        st.session_state["active_main_tab"] = f"Escala {proj_norm}"
         st.session_state["escala_is_editor"] = True
         nome_act = params.get("p80_nome", "").strip().upper()
         disc_act = params.get("p80_disc", "Mecânica")

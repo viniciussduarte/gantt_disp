@@ -205,9 +205,18 @@ class PGCursorWrapper:
             return self._cursor.execute(pg_sql, params)
         return self._cursor.execute(pg_sql)
 
-    def executemany(self, sql: str, param_seq: List[Any]):
+    def executemany(self, sql: str, param_seq: List[Any], page_size: int = 100):
+        if not param_seq:
+            return None
         pg_sql = _convert_sql_placeholders(sql)
-        return self._cursor.executemany(pg_sql, param_seq)
+        clean_seq = [tuple(p) if isinstance(p, (list, tuple)) else (p,) for p in param_seq]
+        if HAS_PSYCOPG2:
+            try:
+                from psycopg2.extras import execute_batch
+                return execute_batch(self._cursor, pg_sql, clean_seq, page_size=page_size)
+            except Exception:
+                pass
+        return self._cursor.executemany(pg_sql, clean_seq)
 
     def fetchone(self) -> Optional[RowWrapper]:
         row = self._cursor.fetchone()

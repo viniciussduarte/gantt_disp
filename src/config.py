@@ -1,11 +1,11 @@
 """
-Configurações, constantes e parâmetros globais da aplicação Gantt & Escalas (v0.3.3).
+Configurações, constantes e parâmetros globais da aplicação Gantt & Escalas (v0.3.4).
 """
 
 from typing import Dict, List, Optional
 
 
-VERSION = "v0.3.3"
+VERSION = "v0.3.4"
 
 
 class Config:
