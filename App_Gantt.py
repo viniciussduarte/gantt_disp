@@ -62,6 +62,21 @@ class App:
             f"Visualização integrada de Estaleiro, Férias, Planejamento Geral e Escalas P-80, P-82 e P-83 ({VERSION}) — {status_icon} **{backend_name}**."
         )
 
+        if not DBManager.is_cloud():
+            diag = DBManager.get_diagnostics()
+            err_msg = diag.get("last_error")
+            with st.expander("ℹ️ Informações de Conexão com o Banco de Dados (Modo SQLite Local)", expanded=False):
+                st.warning(
+                    "**A aplicação está operando com SQLite Local.**\n\n"
+                    + (f"**Diagnóstico de conexão:** `{err_msg}`\n\n" if err_msg else "")
+                    + "Para sincronizar com o **Supabase PostgreSQL** na nuvem (Streamlit Community Cloud):\n"
+                    "1. No painel do Streamlit Cloud, vá em **Settings** -> **Secrets**.\n"
+                    "2. Configure a variável `DATABASE_URL` utilizando o **Connection Pooler IPv4**:\n"
+                    "```toml\n"
+                    'DATABASE_URL = "postgresql://postgres.dzotqvnlwhbrbosgxgwe:[SUA_SENHA]@aws-0-us-east-2.pooler.supabase.com:6543/postgres"\n'
+                    "```"
+                )
+
         # 1. Carregamento prévio da equipe com tratamento fail-fast amigável
         try:
             equipe_df = DataLoader.load_geral_equipe_data()

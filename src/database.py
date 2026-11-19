@@ -65,6 +65,24 @@ def _clean_pg_url(val: Any) -> Optional[str]:
     return s
 
 
+def _get_pooler_candidates(url: str) -> List[str]:
+    """
+    Se a URL for conexão direta IPv6 da Supabase (db.<ref>.supabase.co),
+    deriva automaticamente URLs IPv4 compatíveis do Connection Pooler (PgBouncer).
+    Streamlit Cloud (AWS) não suporta IPv6 de saída, exigindo o pooler IPv4.
+    """
+    m = re.match(r"postgres(?:ql)?://([^:]+):([^@]+)@db\.([a-z0-9]+)\.supabase\.co(?::\d+)?/(.+)", url)
+    if not m:
+        return []
+    _user, pwd, ref, dbname = m.groups()
+    regions = ["us-east-2", "sa-east-1", "us-east-1", "us-west-1", "eu-west-1"]
+    poolers = []
+    for reg in regions:
+        for port in (6543, 5432):
+            poolers.append(f"postgresql://postgres.{ref}:{pwd}@aws-0-{reg}.pooler.supabase.com:{port}/{dbname}")
+    return poolers
+
+
 def get_database_url() -> Optional[str]:
     """
     Recupera a URL de conexão do PostgreSQL (Supabase).
@@ -466,20 +484,48 @@ class DBManager:
                                 pass
                             cls._conn = None
 
-                # Abre nova conexão com timeout agressivo de 5s e autocommit=True para PgBouncer
-                cls._conn = psycopg2.connect(
-                    db_url,
-                    connect_timeout=5,
-                    keepalives=1,
-                    keepalives_idle=30,
-                    keepalives_interval=10,
-                    keepalives_count=3
-                )
-                cls._conn.autocommit = True
-                cls._conn_url = db_url
-                cls._actual_backend = "Supabase (PostgreSQL)"
-                cls._last_error = None
-                return PGConnectionWrapper(cls._conn, keep_open=True)
+                # Abre nova conexão com timeout agressivo de 4s e autocommit=True para PgBouncer
+                conn_obj = None
+                connect_err = None
+                try:
+                    conn_obj = psycopg2.connect(
+                        db_url,
+                        connect_timeout=4,
+                        keepalives=1,
+                        keepalives_idle=30,
+                        keepalives_interval=10,
+                        keepalives_count=3
+                    )
+                except Exception as err:
+                    connect_err = err
+                    # Se falhou conexão direta (comum no Streamlit Cloud por falta de IPv6), tenta o Connection Pooler IPv4
+                    poolers = _get_pooler_candidates(db_url)
+                    for p_candidate in poolers:
+                        try:
+                            conn_obj = psycopg2.connect(
+                                p_candidate,
+                                connect_timeout=3,
+                                keepalives=1,
+                                keepalives_idle=30,
+                                keepalives_interval=10,
+                                keepalives_count=3
+                            )
+                            db_url = p_candidate
+                            connect_err = None
+                            print(f"[DBManager] Conectado com sucesso via Pooler IPv4: {p_candidate.split('@')[1]}")
+                            break
+                        except Exception:
+                            pass
+
+                if conn_obj is not None:
+                    cls._conn = conn_obj
+                    cls._conn.autocommit = True
+                    cls._conn_url = db_url
+                    cls._actual_backend = "Supabase (PostgreSQL)"
+                    cls._last_error = None
+                    return PGConnectionWrapper(cls._conn, keep_open=True)
+                elif connect_err:
+                    raise connect_err
 
             except Exception as e:
                 # Se falhar a conexão com a nuvem, loga alerta e faz fallback para SQLite
